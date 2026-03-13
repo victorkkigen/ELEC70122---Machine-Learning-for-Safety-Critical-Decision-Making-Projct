@@ -5,15 +5,21 @@ This script runs the core experiment to demonstrate that:
 1. Soft concepts leak information that becomes corrupted over time
 2. OPE error with soft concepts grows with trajectory length
 3. Hard concepts remain stable
+
+Run from project root:
+    python experiments/run_experiment.py
 """
 
 import sys
-sys.path.insert(0, '/home/claude/temporal-leakage-ope/src')
+import os
+
+# Add src directory to path (works from project root)
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(project_root, 'src'))
 
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple
-import os
 
 from gridworld import WindyGridworld, collect_trajectory
 from policies import EpsilonGreedyPolicy, OptimalPolicy, RandomPolicy
@@ -242,8 +248,9 @@ def plot_results(results: dict, save_path: str = None):
 
 
 if __name__ == "__main__":
-    # Create results directory
-    os.makedirs('/home/claude/temporal-leakage-ope/results', exist_ok=True)
+    # Create results directory if it doesn't exist
+    results_dir = os.path.join(project_root, 'results')
+    os.makedirs(results_dir, exist_ok=True)
     
     # Run experiment
     results = run_experiment(
@@ -255,8 +262,8 @@ if __name__ == "__main__":
     )
     
     # Plot results
-    plot_results(results, save_path='/home/claude/temporal-leakage-ope/results/main_results.png')
+    plot_results(results, save_path=os.path.join(results_dir, 'main_results.png'))
     
     # Save numerical results
-    np.save('/home/claude/temporal-leakage-ope/results/results.npy', results)
-    print("\nResults saved to /home/claude/temporal-leakage-ope/results/")
+    np.save(os.path.join(results_dir, 'results.npy'), results)
+    print(f"\nResults saved to {results_dir}/")

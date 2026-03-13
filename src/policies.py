@@ -1,309 +1,213 @@
 """
-Policies for Off-Policy Evaluation
+Policies for Windy Gridworld
 
-We need two policies:
-1. Behavior Policy (π_b): Collects the training data (suboptimal, exploratory)
-2. Evaluation Policy (π_e): The policy we want to evaluate (near-optimal)
-
-The key is that π_e differs from π_b, creating distribution shift over time.
+Includes:
+- RandomPolicy: Uniform random actions
+- EpsilonGreedyPolicy: ε-greedy based on value function
+- OptimalPolicy: Near-optimal via value iteration with optional ε exploration
 """
 
 import numpy as np
-from typing import Tuple, Optional
-from gridworld import WindyGridworld
+from typing import Tuple, Dict, Optional
 
 
 class RandomPolicy:
-    """Uniformly random policy - maximum exploration."""
+    """Uniform random policy."""
     
-    def __init__(self, n_actions: int = 4):
+    def __init__(self, n_actions: int = 4, seed: int = None):
         self.n_actions = n_actions
+        self.rng = np.random.RandomState(seed)
     
-    def __call__(self, state: np.ndarray) -> int:
-        return np.random.randint(self.n_actions)
+    def sample_action(self, state: Tuple[int, int]) -> int:
+        return self.rng.randint(self.n_actions)
     
-    def get_prob(self, state: np.ndarray, action: int) -> float:
-        """Return probability of taking action in state."""
-        return 1.0 / self.n_actions
-    
-    def get_all_probs(self, state: np.ndarray) -> np.ndarray:
-        """Return probability distribution over all actions."""
+    def action_probs(self, state: Tuple[int, int]) -> np.ndarray:
         return np.ones(self.n_actions) / self.n_actions
+    
+    def prob(self, state: Tuple[int, int], action: int) -> float:
+        return 1.0 / self.n_actions
 
 
 class EpsilonGreedyPolicy:
     """
-    Epsilon-greedy policy based on a value function.
+    ε-greedy policy based on value iteration.
     
-    With probability epsilon: take random action
-    With probability 1-epsilon: take greedy action toward goal
+    With probability ε: random action
+    With probability 1-ε: greedy action
     """
     
-    def __init__(
-        self,
-        env: WindyGridworld,
-        epsilon: float = 0.1,
-        seed: Optional[int] = None
-    ):
+    def __init__(self, env, epsilon: float = 0.1, gamma: float = 0.99, seed: int = None):
         self.env = env
         self.epsilon = epsilon
-        self.n_actions = env.n_actions
-        self.rng = np.random.RandomState(seed)
-        
-        # Precompute greedy actions (move toward goal)
-        self._compute_greedy_actions()
-    
-    def _compute_greedy_actions(self):
-        """Compute greedy action for each state (simple heuristic: move toward goal)."""
-        self.greedy_actions = {}
-        
-        for row in range(self.env.height):
-            for col in range(self.env.width):
-                state = (row, col)
-                goal = self.env.goal
-                
-                # Determine best action to move toward goal
-                # Account for wind: prefer moving right in wind zones
-                row_diff = goal[0] - row
-                col_diff = goal[1] - col
-                
-                # Priority: horizontal movement first (to get through wind), then vertical
-                if col_diff > 0:
-                    best_action = 1  # Right
-                elif col_diff < 0:
-                    best_action = 3  # Left
-                elif row_diff > 0:
-                    best_action = 2  # Down
-                elif row_diff < 0:
-                    best_action = 0  # Up
-                else:
-                    best_action = 0  # At goal, doesn't matter
-                
-                self.greedy_actions[state] = best_action
-    
-    def __call__(self, state: np.ndarray) -> int:
-        """Select action using epsilon-greedy."""
-        if self.rng.random() < self.epsilon:
-            return self.rng.randint(self.n_actions)
-        else:
-            state_tuple = (int(state[0]), int(state[1]))
-            return self.greedy_actions.get(state_tuple, 0)
-    
-    def get_prob(self, state: np.ndarray, action: int) -> float:
-        """Return probability of taking action in state."""
-        state_tuple = (int(state[0]), int(state[1]))
-        greedy_action = self.greedy_actions.get(state_tuple, 0)
-        
-        if action == greedy_action:
-            return 1.0 - self.epsilon + self.epsilon / self.n_actions
-        else:
-            return self.epsilon / self.n_actions
-    
-    def get_all_probs(self, state: np.ndarray) -> np.ndarray:
-        """Return probability distribution over all actions."""
-        probs = np.ones(self.n_actions) * (self.epsilon / self.n_actions)
-        state_tuple = (int(state[0]), int(state[1]))
-        greedy_action = self.greedy_actions.get(state_tuple, 0)
-        probs[greedy_action] = 1.0 - self.epsilon + self.epsilon / self.n_actions
-        return probs
-
-
-class OptimalPolicy:
-    """
-    Near-optimal policy computed using value iteration.
-    
-    This gives us a strong evaluation policy that differs significantly
-    from the behavior policy.
-    """
-    
-    def __init__(
-        self,
-        env: WindyGridworld,
-        gamma: float = 0.99,
-        epsilon: float = 0.05,  # Small exploration for numerical stability
-        seed: Optional[int] = None
-    ):
-        self.env = env
         self.gamma = gamma
-        self.epsilon = epsilon
-        self.n_actions = env.n_actions
         self.rng = np.random.RandomState(seed)
         
-        # Compute optimal value function and policy
-        self._value_iteration()
+        # Compute value function and policy via value iteration
+        self.V, self.Q = self._value_iteration()
     
-    def _value_iteration(self, theta: float = 1e-6, max_iters: int = 1000):
-        """Compute optimal policy using value iteration."""
-        V = np.zeros((self.env.height, self.env.width))
+    def _value_iteration(self, max_iter: int = 1000, tol: float = 1e-6) -> Tuple[np.ndarray, np.ndarray]:
+        """Run value iteration to compute V and Q."""
+        n_states = self.env.n_states
+        n_actions = self.env.n_actions
         
-        for iteration in range(max_iters):
-            delta = 0
+        V = np.zeros(n_states)
+        Q = np.zeros((n_states, n_actions))
+        
+        for iteration in range(max_iter):
+            V_old = V.copy()
             
-            for row in range(self.env.height):
-                for col in range(self.env.width):
-                    if (row, col) == self.env.goal:
-                        continue
-                    
-                    v = V[row, col]
-                    
-                    # Compute Q-values for all actions
-                    q_values = []
-                    for action in range(self.n_actions):
-                        q = self._compute_q_value(row, col, action, V)
-                        q_values.append(q)
-                    
-                    V[row, col] = max(q_values)
-                    delta = max(delta, abs(v - V[row, col]))
-            
-            if delta < theta:
-                break
-        
-        # Extract greedy policy
-        self.V = V
-        self.greedy_actions = {}
-        
-        for row in range(self.env.height):
-            for col in range(self.env.width):
-                if (row, col) == self.env.goal:
-                    self.greedy_actions[(row, col)] = 0
+            for s_idx in range(n_states):
+                state = self.env.index_to_state(s_idx)
+                
+                if state == self.env.goal:
+                    V[s_idx] = 0
+                    Q[s_idx, :] = 0
                     continue
                 
-                q_values = []
-                for action in range(self.n_actions):
-                    q = self._compute_q_value(row, col, action, V)
-                    q_values.append(q)
+                for a in range(n_actions):
+                    # Simulate taking action a from state
+                    self.env.state = state
+                    next_state, reward, done, _ = self.env.step(a)
+                    next_idx = self.env.state_to_index(next_state)
+                    
+                    Q[s_idx, a] = reward + self.gamma * V[next_idx]
                 
-                self.greedy_actions[(row, col)] = int(np.argmax(q_values))
-    
-    def _compute_q_value(self, row: int, col: int, action: int, V: np.ndarray) -> float:
-        """Compute Q-value for state-action pair."""
-        # Get action effect
-        d_row, d_col = self.env.action_effects[action]
-        new_col = max(0, min(self.env.width - 1, col + d_col))
-        
-        # Expected value over wind stochasticity
-        wind_base = self.env.wind[min(new_col, len(self.env.wind) - 1)]
-        
-        if wind_base == 0 or not self.env.stochastic_wind:
-            # Deterministic case
-            new_row = row + d_row - wind_base
-            new_row = max(0, min(self.env.height - 1, new_row))
+                V[s_idx] = np.max(Q[s_idx])
             
-            if (new_row, new_col) == self.env.goal:
-                return 0.0
-            else:
-                return -1.0 + self.gamma * V[new_row, new_col]
-        else:
-            # Stochastic wind: average over possible outcomes
-            q = 0.0
-            for wind_delta, prob in [(-1, 0.2), (0, 0.6), (1, 0.2)]:
-                wind = max(0, wind_base + wind_delta)
-                new_row = row + d_row - wind
-                new_row = max(0, min(self.env.height - 1, new_row))
-                
-                if (new_row, new_col) == self.env.goal:
-                    q += prob * 0.0
-                else:
-                    q += prob * (-1.0 + self.gamma * V[new_row, new_col])
-            return q
-    
-    def __call__(self, state: np.ndarray) -> int:
-        """Select action using epsilon-greedy on optimal policy."""
-        if self.rng.random() < self.epsilon:
-            return self.rng.randint(self.n_actions)
-        else:
-            state_tuple = (int(state[0]), int(state[1]))
-            return self.greedy_actions.get(state_tuple, 0)
-    
-    def get_prob(self, state: np.ndarray, action: int) -> float:
-        """Return probability of taking action in state."""
-        state_tuple = (int(state[0]), int(state[1]))
-        greedy_action = self.greedy_actions.get(state_tuple, 0)
+            if np.max(np.abs(V - V_old)) < tol:
+                break
         
-        if action == greedy_action:
-            return 1.0 - self.epsilon + self.epsilon / self.n_actions
+        return V, Q
+    
+    def sample_action(self, state: Tuple[int, int]) -> int:
+        """Sample action according to ε-greedy."""
+        if self.rng.random() < self.epsilon:
+            return self.rng.randint(self.env.n_actions)
         else:
-            return self.epsilon / self.n_actions
+            s_idx = self.env.state_to_index(state)
+            return np.argmax(self.Q[s_idx])
     
-    def get_all_probs(self, state: np.ndarray) -> np.ndarray:
-        """Return probability distribution over all actions."""
-        probs = np.ones(self.n_actions) * (self.epsilon / self.n_actions)
-        state_tuple = (int(state[0]), int(state[1]))
-        greedy_action = self.greedy_actions.get(state_tuple, 0)
-        probs[greedy_action] = 1.0 - self.epsilon + self.epsilon / self.n_actions
+    def action_probs(self, state: Tuple[int, int]) -> np.ndarray:
+        """Return probability distribution over actions."""
+        s_idx = self.env.state_to_index(state)
+        greedy_action = np.argmax(self.Q[s_idx])
+        
+        probs = np.ones(self.env.n_actions) * (self.epsilon / self.env.n_actions)
+        probs[greedy_action] += (1 - self.epsilon)
+        
         return probs
+    
+    def prob(self, state: Tuple[int, int], action: int) -> float:
+        """Return probability of taking action in state."""
+        return self.action_probs(state)[action]
 
 
-def compute_importance_ratio(
-    behavior_policy,
-    eval_policy,
-    state: np.ndarray,
-    action: int
-) -> float:
+class OptimalPolicy(EpsilonGreedyPolicy):
     """
-    Compute importance sampling ratio: π_e(a|s) / π_b(a|s)
+    Near-optimal policy from value iteration.
+    
+    Same as EpsilonGreedyPolicy but with very low epsilon by default.
     """
-    prob_b = behavior_policy.get_prob(state, action)
-    prob_e = eval_policy.get_prob(state, action)
     
-    # Clip to avoid division by zero
-    prob_b = max(prob_b, 1e-10)
+    def __init__(self, env, epsilon: float = 0.05, gamma: float = 0.99, seed: int = None):
+        super().__init__(env, epsilon=epsilon, gamma=gamma, seed=seed)
+
+
+class ConceptPolicy:
+    """
+    Policy conditioned on concepts instead of states.
     
-    return prob_e / prob_b
+    π^c(a|c) where c = φ(s)
+    
+    This is learned by aggregating state-action statistics over concept groups.
+    """
+    
+    def __init__(self, concept_fn, base_policy, n_actions: int = 4, n_concepts: int = 5):
+        """
+        Args:
+            concept_fn: Function mapping state -> concept index
+            base_policy: The underlying state-based policy to aggregate
+            n_actions: Number of actions
+            n_concepts: Number of discrete concept values
+        """
+        self.concept_fn = concept_fn
+        self.base_policy = base_policy
+        self.n_actions = n_actions
+        self.n_concepts = n_concepts
+        
+        # Will be populated by learn_from_data
+        self.concept_action_counts = None
+        self.concept_action_probs = None
+    
+    def learn_from_data(self, trajectories, smoothing: float = 1.0):
+        """
+        Learn concept-based policy from trajectory data.
+        
+        Args:
+            trajectories: List of trajectories
+            smoothing: Laplace smoothing parameter
+        """
+        # Count (concept, action) pairs
+        counts = np.zeros((self.n_concepts, self.n_actions)) + smoothing
+        
+        for traj in trajectories:
+            for step in traj:
+                state = step['state']
+                action = step['action']
+                concept = self.concept_fn(state)
+                
+                if isinstance(concept, np.ndarray):
+                    concept = int(np.argmax(concept))
+                
+                counts[concept, action] += 1
+        
+        # Normalize to probabilities
+        self.concept_action_counts = counts
+        self.concept_action_probs = counts / counts.sum(axis=1, keepdims=True)
+    
+    def action_probs(self, state: Tuple[int, int]) -> np.ndarray:
+        """Return action probabilities given state (via concept)."""
+        concept = self.concept_fn(state)
+        if isinstance(concept, np.ndarray):
+            concept = int(np.argmax(concept))
+        
+        if self.concept_action_probs is None:
+            # Fall back to base policy
+            return self.base_policy.action_probs(state)
+        
+        return self.concept_action_probs[concept]
+    
+    def prob(self, state: Tuple[int, int], action: int) -> float:
+        """Return probability of taking action in state."""
+        return self.action_probs(state)[action]
 
 
 if __name__ == "__main__":
-    # Test policies
+    from gridworld import WindyGridworld, collect_trajectory
+    
     env = WindyGridworld()
     
-    print("Testing Policies")
-    print("=" * 50)
+    # Test policies
+    print("Testing EpsilonGreedyPolicy (ε=0.3)...")
+    behavior = EpsilonGreedyPolicy(env, epsilon=0.3, seed=42)
+    print(f"  Action probs at start {env.start}: {behavior.action_probs(env.start)}")
     
-    # Test random policy
-    random_policy = RandomPolicy()
-    print("\nRandom Policy:")
-    print(f"  Action probs: {random_policy.get_all_probs(np.array([3, 0]))}")
+    print("\nTesting OptimalPolicy (ε=0.05)...")
+    optimal = OptimalPolicy(env, epsilon=0.05, seed=42)
+    print(f"  Action probs at start {env.start}: {optimal.action_probs(env.start)}")
     
-    # Test epsilon-greedy behavior policy
-    behavior_policy = EpsilonGreedyPolicy(env, epsilon=0.3, seed=42)
-    print("\nBehavior Policy (ε=0.3):")
-    test_state = np.array([3, 0])  # Start state
-    print(f"  At start {test_state}: probs = {behavior_policy.get_all_probs(test_state)}")
-    print(f"  Greedy action: {behavior_policy.greedy_actions[(3, 0)]}")
+    # Compare trajectory lengths
+    print("\nCollecting trajectories...")
     
-    # Test optimal evaluation policy
-    eval_policy = OptimalPolicy(env, epsilon=0.05, seed=42)
-    print("\nEvaluation Policy (optimal, ε=0.05):")
-    print(f"  At start {test_state}: probs = {eval_policy.get_all_probs(test_state)}")
-    print(f"  Greedy action: {eval_policy.greedy_actions[(3, 0)]}")
+    behavior_lengths = []
+    for _ in range(20):
+        traj = collect_trajectory(env, behavior, max_steps=100)
+        behavior_lengths.append(len(traj))
     
-    # Show value function
-    print("\nOptimal Value Function:")
-    for row in range(env.height):
-        values = [f"{eval_policy.V[row, col]:6.2f}" for col in range(env.width)]
-        print("  " + " ".join(values))
+    optimal_lengths = []
+    for _ in range(20):
+        traj = collect_trajectory(env, optimal, max_steps=100)
+        optimal_lengths.append(len(traj))
     
-    # Test importance ratios
-    print("\nImportance Ratios at start state:")
-    for action in range(4):
-        ratio = compute_importance_ratio(behavior_policy, eval_policy, test_state, action)
-        action_names = ['Up', 'Right', 'Down', 'Left']
-        print(f"  {action_names[action]}: {ratio:.3f}")
-    
-    # Run a trajectory comparison
-    print("\n" + "=" * 50)
-    print("Trajectory Comparison")
-    print("=" * 50)
-    
-    from gridworld import collect_trajectory
-    
-    np.random.seed(42)
-    
-    # Behavior policy trajectory
-    traj_b = collect_trajectory(env, behavior_policy, max_steps=50)
-    print(f"\nBehavior policy: {len(traj_b)} steps")
-    
-    # Evaluation policy trajectory
-    env.reset()
-    traj_e = collect_trajectory(env, eval_policy, max_steps=50)
-    print(f"Evaluation policy: {len(traj_e)} steps")
+    print(f"  Behavior (ε=0.3): mean length = {np.mean(behavior_lengths):.1f}")
+    print(f"  Optimal (ε=0.05): mean length = {np.mean(optimal_lengths):.1f}")

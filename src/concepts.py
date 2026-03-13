@@ -1,398 +1,362 @@
 """
-Concept Bottleneck Layers for OPE
+Concept Extractors for Windy Gridworld
 
-Two types of concepts:
-1. Hard Concepts: Binary/discrete values based on interpretable rules
-2. Soft Concepts: Learned embeddings that can leak extra information
-
-The key insight from Espinosa Zarlenga et al. (2025):
-- Soft concepts "leak" information beyond the concept meaning
-- This leakage becomes corrupted under distribution shift (OOD inputs)
-- We hypothesize this corruption compounds over time in sequential OPE
+Includes:
+- HardConcepts: Rule-based binary concepts (no leakage)
+- SoftConcepts: Neural network concept encoder (can leak)
+- measure_leakage: Probe to measure information leakage in embeddings
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Tuple, List, Dict, Optional
 
 
 class HardConcepts:
     """
-    Hard concepts: Deterministic, interpretable rules.
+    Rule-based binary concepts with no information leakage.
     
-    No leakage because concepts are computed from explicit rules,
-    not learned embeddings.
-    
-    Concepts for Gridworld:
-    1. near_goal: 1 if Manhattan distance to goal <= 2
-    2. in_wind_zone: 1 if current column has wind > 0
-    3. near_wall: 1 if adjacent to any wall
-    4. high_wind: 1 if wind strength >= 2
-    5. goal_reachable_soon: 1 if distance <= 4
+    Concepts:
+    - near_goal: Manhattan distance to goal <= 2
+    - high_wind: Current column has wind >= 2
+    - in_left_half: Column < 5
+    - in_top_half: Row < 3 (closer to top)
+    - near_start: Manhattan distance to start <= 2
     """
     
     def __init__(self, env):
         self.env = env
         self.n_concepts = 5
         self.concept_names = [
-            'near_goal',
-            'in_wind_zone', 
-            'near_wall',
-            'high_wind',
-            'goal_reachable_soon'
+            'near_goal', 'high_wind', 'in_left_half', 
+            'in_top_half', 'near_start'
         ]
     
-    def __call__(self, state: np.ndarray) -> np.ndarray:
-        """Compute hard concepts for a state."""
-        row, col = int(state[0]), int(state[1])
+    def extract(self, state: Tuple[int, int]) -> np.ndarray:
+        """Extract binary concept vector from state."""
+        row, col = state
         
-        # Concept 1: Near goal (Manhattan distance <= 2)
+        # Concept 1: Near goal
         goal_dist = abs(row - self.env.goal[0]) + abs(col - self.env.goal[1])
-        near_goal = 1.0 if goal_dist <= 2 else 0.0
+        near_goal = float(goal_dist <= 2)
         
-        # Concept 2: In wind zone
-        wind = self.env.wind[min(col, len(self.env.wind) - 1)]
-        in_wind_zone = 1.0 if wind > 0 else 0.0
+        # Concept 2: High wind
+        high_wind = float(self.env.wind[col] >= 2)
         
-        # Concept 3: Near wall (adjacent to boundary)
-        near_wall = 1.0 if (row == 0 or row == self.env.height - 1 or 
-                           col == 0 or col == self.env.width - 1) else 0.0
+        # Concept 3: In left half
+        in_left = float(col < 5)
         
-        # Concept 4: High wind
-        high_wind = 1.0 if wind >= 2 else 0.0
+        # Concept 4: In top half
+        in_top = float(row < 3)
         
-        # Concept 5: Goal reachable soon (within 4 steps optimally)
-        goal_reachable_soon = 1.0 if goal_dist <= 4 else 0.0
+        # Concept 5: Near start
+        start_dist = abs(row - self.env.start[0]) + abs(col - self.env.start[1])
+        near_start = float(start_dist <= 2)
         
-        return np.array([near_goal, in_wind_zone, near_wall, high_wind, goal_reachable_soon], 
-                        dtype=np.float32)
+        return np.array([near_goal, high_wind, in_left, in_top, near_start])
     
-    def batch_forward(self, states: np.ndarray) -> np.ndarray:
-        """Compute concepts for a batch of states."""
-        return np.array([self(s) for s in states])
+    def __call__(self, state: Tuple[int, int]) -> np.ndarray:
+        return self.extract(state)
+    
+    def to_index(self, state: Tuple[int, int]) -> int:
+        """Convert concepts to single index (0-31)."""
+        concepts = self.extract(state)
+        idx = 0
+        for i, c in enumerate(concepts):
+            idx += int(c) * (2 ** i)
+        return idx
 
 
 class SoftConceptEncoder:
     """
-    Soft concept encoder: Simple MLP that outputs concept embeddings.
+    Simple MLP encoder from state features to concept probabilities.
     
-    Numpy-based implementation.
-    
-    Unlike hard concepts, soft concepts:
-    - Are learned from data
-    - Can encode information beyond the concept definition (leakage)
-    - The leakage becomes corrupted under distribution shift
+    This can leak information beyond the concepts if the hidden layers
+    encode more than just the concept labels.
     """
     
-    def __init__(
-        self,
-        input_dim: int = 6,      # State features dimension
-        n_concepts: int = 5,     # Number of concepts
-        embedding_dim: int = 8,  # Dimension per concept embedding
-        hidden_dim: int = 32,
-        seed: int = 42
-    ):
-        self.n_concepts = n_concepts
-        self.embedding_dim = embedding_dim
+    def __init__(self, input_dim: int = 8, hidden_dim: int = 32, 
+                 output_dim: int = 5, seed: int = None):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         
-        # Initialize weights randomly
-        np.random.seed(seed)
-        self.W1 = np.random.randn(input_dim, hidden_dim) * 0.1
+        rng = np.random.RandomState(seed)
+        
+        # Initialize weights with Xavier initialization
+        self.W1 = rng.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
         self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, hidden_dim) * 0.1
+        
+        self.W2 = rng.randn(hidden_dim, hidden_dim) * np.sqrt(2.0 / hidden_dim)
         self.b2 = np.zeros(hidden_dim)
         
-        # Concept heads: one per concept, outputs (prob, embedding)
-        self.concept_weights = [
-            np.random.randn(hidden_dim, embedding_dim + 1) * 0.1
-            for _ in range(n_concepts)
-        ]
-        self.concept_biases = [
-            np.zeros(embedding_dim + 1)
-            for _ in range(n_concepts)
-        ]
-        
-        self.concept_names = [
-            'near_goal',
-            'in_wind_zone',
-            'near_wall', 
-            'high_wind',
-            'goal_reachable_soon'
-        ]
-        
-        self._trained = False
-    
-    def _relu(self, x):
-        return np.maximum(0, x)
-    
-    def _sigmoid(self, x):
-        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+        self.W3 = rng.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
+        self.b3 = np.zeros(output_dim)
     
     def forward(self, x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
         Forward pass.
         
-        Args:
-            x: State features [batch_size, input_dim] or [input_dim]
-            
         Returns:
-            concept_probs: [batch_size, n_concepts] or [n_concepts]
-            concept_embeddings: [batch_size, n_concepts, embedding_dim] or [n_concepts, embedding_dim]
+            probs: Sigmoid probabilities for each concept
+            hidden: Hidden layer activations (for leakage analysis)
         """
-        single_input = False
-        if len(x.shape) == 1:
-            x = x.reshape(1, -1)
-            single_input = True
+        # Layer 1
+        h1 = np.maximum(0, x @ self.W1 + self.b1)  # ReLU
         
-        # Forward through shared encoder
-        h = self._relu(x @ self.W1 + self.b1)
-        h = self._relu(h @ self.W2 + self.b2)
+        # Layer 2
+        h2 = np.maximum(0, h1 @ self.W2 + self.b2)  # ReLU
         
-        # Forward through concept heads
-        concept_probs = []
-        concept_embeddings = []
+        # Output layer
+        logits = h2 @ self.W3 + self.b3
+        probs = 1 / (1 + np.exp(-logits))  # Sigmoid
         
-        for i in range(self.n_concepts):
-            out = h @ self.concept_weights[i] + self.concept_biases[i]
-            prob = self._sigmoid(out[:, 0])
-            embedding = out[:, 1:]
-            
-            concept_probs.append(prob)
-            concept_embeddings.append(embedding)
-        
-        concept_probs = np.stack(concept_probs, axis=1)
-        concept_embeddings = np.stack(concept_embeddings, axis=1)
-        
-        if single_input:
-            concept_probs = concept_probs[0]
-            concept_embeddings = concept_embeddings[0]
-        
-        return concept_probs, concept_embeddings
+        return probs, h2
     
-    def get_concepts_with_leakage(self, x: np.ndarray) -> np.ndarray:
+    def train_step(self, x: np.ndarray, y: np.ndarray, lr: float = 0.01) -> float:
         """
-        Get concept representation including leaked information.
+        Single training step with gradient descent.
         
-        This is what causes problems under distribution shift!
-        The embedding contains info beyond just the concept probability.
+        Args:
+            x: Input features (batch_size, input_dim)
+            y: Target concept labels (batch_size, output_dim)
+            lr: Learning rate
+        
+        Returns:
+            Binary cross-entropy loss
         """
-        concept_probs, concept_embeddings = self.forward(x)
+        batch_size = x.shape[0]
         
-        if len(concept_probs.shape) == 1:
-            # Single sample
-            full_repr = np.concatenate([
-                concept_probs.reshape(-1, 1),
-                concept_embeddings
-            ], axis=1)
-            return full_repr.flatten()
-        else:
-            # Batch
-            full_repr = np.concatenate([
-                concept_probs[:, :, np.newaxis],
-                concept_embeddings
-            ], axis=2)
-            return full_repr.reshape(full_repr.shape[0], -1)
-    
-    def get_concepts_no_leakage(self, x: np.ndarray) -> np.ndarray:
-        """
-        Get only concept probabilities (no leaked embeddings).
+        # Forward pass
+        h1 = np.maximum(0, x @ self.W1 + self.b1)
+        h2 = np.maximum(0, h1 @ self.W2 + self.b2)
+        logits = h2 @ self.W3 + self.b3
+        probs = 1 / (1 + np.exp(-np.clip(logits, -20, 20)))
         
-        This should be robust to distribution shift.
-        """
-        concept_probs, _ = self.forward(x)
-        return concept_probs
-    
-    def train_on_data(
-        self,
-        features: np.ndarray,
-        targets: np.ndarray,
-        epochs: int = 100,
-        lr: float = 0.01
-    ):
-        """
-        Train the encoder to predict concept targets.
+        # Loss
+        eps = 1e-7
+        loss = -np.mean(y * np.log(probs + eps) + (1 - y) * np.log(1 - probs + eps))
         
-        Simple gradient descent training.
-        """
-        n_samples = features.shape[0]
+        # Backward pass
+        d_logits = (probs - y) / batch_size
         
-        for epoch in range(epochs):
-            # Forward pass
-            h1 = self._relu(features @ self.W1 + self.b1)
-            h2 = self._relu(h1 @ self.W2 + self.b2)
-            
-            total_loss = 0.0
-            
-            for i in range(self.n_concepts):
-                out = h2 @ self.concept_weights[i] + self.concept_biases[i]
-                pred = self._sigmoid(out[:, 0])
-                target = targets[:, i]
-                
-                # Binary cross entropy loss
-                eps = 1e-7
-                loss = -np.mean(target * np.log(pred + eps) + (1 - target) * np.log(1 - pred + eps))
-                total_loss += loss
-                
-                # Gradient for concept head (simplified)
-                error = pred - target
-                grad_W = h2.T @ error.reshape(-1, 1) / n_samples
-                self.concept_weights[i][:, 0] -= lr * grad_W.flatten()
-                self.concept_biases[i][0] -= lr * np.mean(error)
-            
-            if (epoch + 1) % 20 == 0:
-                print(f"    Epoch {epoch + 1}/{epochs}, Loss: {total_loss / self.n_concepts:.4f}")
+        d_W3 = h2.T @ d_logits
+        d_b3 = np.sum(d_logits, axis=0)
         
-        self._trained = True
+        d_h2 = d_logits @ self.W3.T
+        d_h2 = d_h2 * (h2 > 0)  # ReLU gradient
+        
+        d_W2 = h1.T @ d_h2
+        d_b2 = np.sum(d_h2, axis=0)
+        
+        d_h1 = d_h2 @ self.W2.T
+        d_h1 = d_h1 * (h1 > 0)
+        
+        d_W1 = x.T @ d_h1
+        d_b1 = np.sum(d_h1, axis=0)
+        
+        # Update weights
+        self.W3 -= lr * d_W3
+        self.b3 -= lr * d_b3
+        self.W2 -= lr * d_W2
+        self.b2 -= lr * d_b2
+        self.W1 -= lr * d_W1
+        self.b1 -= lr * d_b1
+        
+        return loss
 
 
 class SoftConcepts:
     """
-    Wrapper class for soft concepts that matches HardConcepts interface.
+    Neural network-based soft concept extractor.
+    
+    Can return:
+    - Just concept probabilities (use_leakage=False)
+    - Probabilities + hidden embeddings (use_leakage=True)
+    
+    The hidden embeddings can "leak" information beyond the concept labels.
     """
     
-    def __init__(
-        self,
-        env,
-        use_leakage: bool = True,
-        embedding_dim: int = 8
-    ):
+    def __init__(self, env, use_leakage: bool = True, 
+                 hidden_dim: int = 32, seed: int = None):
         self.env = env
         self.use_leakage = use_leakage
-        self.embedding_dim = embedding_dim
         self.n_concepts = 5
         
-        # Initialize encoder
-        self.encoder = SoftConceptEncoder(
-            input_dim=6,
-            n_concepts=self.n_concepts,
-            embedding_dim=embedding_dim
-        )
+        # Feature dimension from environment
+        sample_state = (0, 0)
+        sample_features = env.state_to_features(sample_state)
+        self.input_dim = len(sample_features)
         
-        self.concept_names = self.encoder.concept_names
+        self.encoder = SoftConceptEncoder(
+            input_dim=self.input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=self.n_concepts,
+            seed=seed
+        )
     
-    def __call__(self, state: np.ndarray) -> np.ndarray:
-        """Compute soft concepts for a state."""
-        # Get state features
-        row, col = int(state[0]), int(state[1])
-        features = self._compute_features(row, col)
+    def extract(self, state: Tuple[int, int]) -> np.ndarray:
+        """
+        Extract concept representation from state.
+        
+        If use_leakage=True: returns concatenation of [probs, hidden]
+        If use_leakage=False: returns just probs
+        """
+        features = self.env.state_to_features(state)
+        probs, hidden = self.encoder.forward(features)
         
         if self.use_leakage:
-            concepts = self.encoder.get_concepts_with_leakage(features)
+            return np.concatenate([probs, hidden])
         else:
-            concepts = self.encoder.get_concepts_no_leakage(features)
-        
-        return concepts
+            return probs
     
-    def _compute_features(self, row: int, col: int) -> np.ndarray:
-        """Compute state features for the encoder."""
-        norm_row = row / (self.env.height - 1) if self.env.height > 1 else 0.0
-        norm_col = col / (self.env.width - 1) if self.env.width > 1 else 0.0
-        
-        goal_dist = (abs(row - self.env.goal[0]) + abs(col - self.env.goal[1]))
-        max_dist = self.env.height + self.env.width - 2
-        norm_goal_dist = goal_dist / max_dist if max_dist > 0 else 0.0
-        
-        wind_strength = self.env.wind[min(col, len(self.env.wind) - 1)] / 2.0
-        in_wind_zone = 1.0 if self.env.wind[min(col, len(self.env.wind) - 1)] > 0 else 0.0
-        
-        dist_to_wall = min(row, self.env.height - 1 - row, col, self.env.width - 1 - col)
-        norm_wall_dist = dist_to_wall / (min(self.env.height, self.env.width) / 2)
-        
-        return np.array([norm_row, norm_col, norm_goal_dist, 
-                        wind_strength, in_wind_zone, norm_wall_dist], dtype=np.float32)
+    def extract_probs_only(self, state: Tuple[int, int]) -> np.ndarray:
+        """Extract only concept probabilities (no hidden layer)."""
+        features = self.env.state_to_features(state)
+        probs, _ = self.encoder.forward(features)
+        return probs
     
-    def batch_forward(self, states: np.ndarray) -> np.ndarray:
-        """Compute concepts for a batch of states."""
-        return np.array([self(s) for s in states])
+    def __call__(self, state: Tuple[int, int]) -> np.ndarray:
+        return self.extract(state)
     
-    def train_on_trajectories(
-        self,
-        trajectories: List[List[dict]],
-        hard_concepts,
-        epochs: int = 100
-    ):
+    def train_on_trajectories(self, trajectories: List[List[Dict]], 
+                              hard_concepts: HardConcepts,
+                              epochs: int = 100, lr: float = 0.01,
+                              verbose: bool = False):
         """
-        Train soft concept encoder to predict hard concepts.
-        
-        The encoder will learn to match hard concepts but will also
-        encode additional information in the embeddings (leakage).
+        Train the encoder to predict hard concept labels from features.
         """
-        # Collect training data
-        features_list = []
-        concepts_list = []
+        # Collect all (features, labels) pairs
+        X = []
+        Y = []
         
         for traj in trajectories:
             for step in traj:
-                row, col = int(step['state'][0]), int(step['state'][1])
-                features_list.append(self._compute_features(row, col))
-                concepts_list.append(hard_concepts(step['state']))
+                state = step['state']
+                features = step.get('features', self.env.state_to_features(state))
+                labels = hard_concepts.extract(state)
+                X.append(features)
+                Y.append(labels)
         
-        features = np.array(features_list)
-        targets = np.array(concepts_list)
+        X = np.array(X)
+        Y = np.array(Y)
         
-        # Train
-        self.encoder.train_on_data(features, targets, epochs=epochs)
+        # Training loop
+        for epoch in range(epochs):
+            # Shuffle
+            perm = np.random.permutation(len(X))
+            X_shuffled = X[perm]
+            Y_shuffled = Y[perm]
+            
+            # Train on mini-batches
+            batch_size = 32
+            total_loss = 0
+            n_batches = 0
+            
+            for i in range(0, len(X), batch_size):
+                X_batch = X_shuffled[i:i+batch_size]
+                Y_batch = Y_shuffled[i:i+batch_size]
+                
+                loss = self.encoder.train_step(X_batch, Y_batch, lr=lr)
+                total_loss += loss
+                n_batches += 1
+            
+            if verbose and (epoch + 1) % 20 == 0:
+                avg_loss = total_loss / n_batches
+                print(f"    Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.4f}")
 
 
-def measure_leakage(
-    soft_concepts,
-    states: np.ndarray,
-    features: np.ndarray
-) -> float:
+def measure_leakage(concept_extractor, states: np.ndarray, 
+                    features: np.ndarray) -> float:
     """
-    Measure information leakage by training a probe to predict raw state from concepts.
+    Measure information leakage in concept embeddings.
     
-    High R² means concepts leak a lot of state information.
-    This is the metric from Espinosa Zarlenga et al. (2025).
+    Uses a linear probe: Can we predict raw features from concept embeddings?
+    High R² = high leakage (embeddings encode extra info beyond concepts)
+    
+    Args:
+        concept_extractor: HardConcepts or SoftConcepts instance
+        states: Array of states to evaluate
+        features: Corresponding raw feature vectors
+    
+    Returns:
+        R² score of linear regression from embeddings to features
     """
     from sklearn.linear_model import Ridge
-    from sklearn.metrics import r2_score
+    from sklearn.model_selection import cross_val_score
     
-    # Get soft concept representations
-    concept_repr = soft_concepts.batch_forward(states)
+    # Extract concept embeddings
+    embeddings = []
+    for state in states:
+        if isinstance(state, np.ndarray):
+            state = tuple(state)
+        emb = concept_extractor(state)
+        embeddings.append(emb)
     
-    # Train probe to predict raw state features from concepts
+    embeddings = np.array(embeddings)
+    
+    # Fit linear probe
     probe = Ridge(alpha=1.0)
-    probe.fit(concept_repr, features)
     
-    # Measure R²
-    pred_features = probe.predict(concept_repr)
-    r2 = r2_score(features, pred_features)
-    
-    return r2
+    try:
+        scores = cross_val_score(probe, embeddings, features, 
+                                 cv=min(5, len(embeddings) // 10 + 1), 
+                                 scoring='r2')
+        return max(0, scores.mean())  # Clamp negative R² to 0
+    except:
+        return 0.0
 
 
 if __name__ == "__main__":
-    import sys
-    sys.path.insert(0, '/home/claude/temporal-leakage-ope/src')
-    
     from gridworld import WindyGridworld, collect_trajectory
     from policies import EpsilonGreedyPolicy
-    
-    print("Testing Concept Modules")
-    print("=" * 50)
     
     env = WindyGridworld()
     
     # Test hard concepts
+    print("Testing HardConcepts...")
     hard = HardConcepts(env)
-    test_state = np.array([3, 0])  # Start
-    print(f"\nHard concepts at start {test_state}:")
-    concepts = hard(test_state)
-    for name, val in zip(hard.concept_names, concepts):
-        print(f"  {name}: {val}")
+    
+    test_states = [(3, 0), (3, 7), (0, 6), (6, 3)]
+    for state in test_states:
+        concepts = hard.extract(state)
+        print(f"  State {state}: {concepts} (names: {hard.concept_names})")
     
     # Test soft concepts
-    print("\n" + "=" * 50)
-    print("Soft Concepts")
-    
+    print("\nTesting SoftConcepts...")
     soft = SoftConcepts(env, use_leakage=True)
-    concepts_with_leak = soft(test_state)
-    print(f"\nSoft concepts (with leakage) shape: {concepts_with_leak.shape}")
-    
     soft_no_leak = SoftConcepts(env, use_leakage=False)
-    concepts_no_leak = soft_no_leak(test_state)
-    print(f"Soft concepts (no leakage) shape: {concepts_no_leak.shape}")
     
-    print("\n✓ Concepts module ready!")
+    # Generate training data
+    policy = EpsilonGreedyPolicy(env, epsilon=0.3, seed=42)
+    trajectories = []
+    for _ in range(50):
+        traj = collect_trajectory(env, policy, max_steps=50)
+        trajectories.append(traj)
+    
+    # Train soft concepts
+    print("  Training soft concept encoder...")
+    soft.train_on_trajectories(trajectories, hard, epochs=100, verbose=True)
+    soft_no_leak.encoder = soft.encoder  # Share weights
+    
+    # Test output shapes
+    print(f"\n  Soft (with leakage) output shape: {soft.extract((3, 0)).shape}")
+    print(f"  Soft (no leakage) output shape: {soft_no_leak.extract((3, 0)).shape}")
+    
+    # Measure leakage
+    print("\nMeasuring leakage...")
+    all_states = []
+    all_features = []
+    for traj in trajectories[:20]:
+        for step in traj:
+            all_states.append(step['state'])
+            all_features.append(step['features'])
+    all_states = np.array(all_states)
+    all_features = np.array(all_features)
+    
+    leakage_hard = measure_leakage(hard, all_states, all_features)
+    leakage_soft = measure_leakage(soft, all_states, all_features)
+    leakage_soft_no_leak = measure_leakage(soft_no_leak, all_states, all_features)
+    
+    print(f"  Hard concepts leakage R²: {leakage_hard:.4f}")
+    print(f"  Soft concepts (with embeddings) leakage R²: {leakage_soft:.4f}")
+    print(f"  Soft concepts (probs only) leakage R²: {leakage_soft_no_leak:.4f}")
