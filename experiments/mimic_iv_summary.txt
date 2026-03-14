@@ -1,0 +1,11 @@
+MIMIC-IV Demo Dataset Summary (Preprocessed)
+==================================================
+
+Number of trajectories: 136
+Mortality rate: 12.5%
+Mean trajectory length: 13.7 time bins
+Time bin size: 4.0 hours
+Number of features: 18
+Number of actions: 25
+
+Features: ['heart_rate', 'sbp', 'dbp', 'mbp', 'resp_rate', 'spo2', 'temperature', 'gcs_total', 'lactate', 'creatinine', 'bilirubin', 'platelet', 'wbc', 'hemoglobin', 'potassium', 'sodium', 'glucose', 'bun']

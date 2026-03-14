@@ -1,15 +1,12 @@
 """
 FIXED Experiment: Temporal Leakage Poisoning in Concept-Based OPE
 
-This experiment ACTUALLY shows that OPE error compounds over time.
+Experiments:
+1. Leakage degradation (probe R² over time)
+2. OPE error compounding (hard vs soft vs gated vs conformal)
+3. Conformal gating fix (distribution-free OOD detection)
 
-Key changes from the broken experiment:
-1. Build concept-based policies that use soft concept predictions
-2. Run CPDIS with those policies
-3. Measure OPE error at different trajectory lengths
-4. Show error grows with trajectory length
-
-Run: python experiments/fixed_experiment.py
+Run: python experiments/temporal_leakage_experiment.py
 """
 
 import sys
@@ -23,511 +20,520 @@ from typing import List, Dict, Tuple
 
 from gridworld import WindyGridworld, collect_trajectory
 from policies import EpsilonGreedyPolicy, OptimalPolicy
-from concepts import HardConcepts, SoftConcepts
+from concepts import HardConcepts, SoftConcepts, GatedSoftConcepts, ConformalGatedConcepts, measure_leakage
 from ope import monte_carlo_ground_truth
 from utils import set_seed, print_trajectory_stats
 
 
 class ConceptBasedPolicy:
-    """
-    A policy that maps state → concept → action probabilities.
-    
-    This is the key piece that was missing. Instead of π(a|s), we have:
-    1. φ(s) → c  (concept extractor)
-    2. π^c(a|c)  (concept-conditioned policy)
-    """
-    
+    """Maps state -> concept -> action probabilities."""
+
     def __init__(self, concept_extractor, n_concepts=32, n_actions=4):
-        """
-        Args:
-            concept_extractor: Function that maps state → concept index
-            n_concepts: Number of possible concept values (2^5 = 32 for our 5 binary concepts)
-            n_actions: Number of actions
-        """
         self.concept_extractor = concept_extractor
         self.n_concepts = n_concepts
-        self.n_actions = n_actions
-        
-        # π^c(a|c) - probability of action given concept
-        # Initialize uniform, will be learned from data
+        self.n_actions  = n_actions
         self.policy_table = np.ones((n_concepts, n_actions)) / n_actions
-    
+
     def state_to_concept_index(self, state) -> int:
-        """Convert state to discrete concept index."""
         concept_vec = self.concept_extractor(state)
-        
-        # Take first 5 dimensions (concept probabilities)
         if len(concept_vec) > 5:
             concept_vec = concept_vec[:5]
-        
-        # Threshold at 0.5 to get binary
         binary = (concept_vec > 0.5).astype(int)
-        
-        # Convert to index (0-31)
-        idx = sum(b * (2 ** i) for i, b in enumerate(binary))
-        return idx
-    
-    def learn_from_trajectories(self, trajectories: List[List[Dict]], smoothing: float = 1.0):
-        """
-        Learn π^c(a|c) from trajectory data.
-        
-        Count how often each action is taken for each concept, then normalize.
-        """
+        return sum(b * (2 ** i) for i, b in enumerate(binary))
+
+    def learn_from_trajectories(self, trajectories, smoothing=1.0):
         counts = np.ones((self.n_concepts, self.n_actions)) * smoothing
-        
         for traj in trajectories:
             for step in traj:
-                state = step['state']
-                action = step['action']
-                c_idx = self.state_to_concept_index(state)
-                counts[c_idx, action] += 1
-        
-        # Normalize to probabilities
+                c = self.state_to_concept_index(step['state'])
+                counts[c, step['action']] += 1
         self.policy_table = counts / counts.sum(axis=1, keepdims=True)
-    
+
     def prob(self, state, action) -> float:
-        """Return π^c(a|c) where c = φ(s)."""
-        c_idx = self.state_to_concept_index(state)
-        return self.policy_table[c_idx, action]
-    
+        return float(self.policy_table[self.state_to_concept_index(state), action])
+
     def action_probs(self, state) -> np.ndarray:
-        """Return full action distribution for a state."""
-        c_idx = self.state_to_concept_index(state)
-        return self.policy_table[c_idx]
+        return self.policy_table[self.state_to_concept_index(state)]
 
 
-def cpdis_estimate_by_horizon(
-    trajectories: List[List[Dict]],
-    behavior_concept_policy: ConceptBasedPolicy,
-    eval_concept_policy: ConceptBasedPolicy,
-    max_horizon: int,
-    gamma: float = 0.99
-) -> Tuple[float, float, float]:
+class GatedConceptBasedPolicy:
     """
-    Run CPDIS up to a specific horizon.
-    
-    Returns:
-        (estimate, variance, effective_sample_size)
+    prob(a|s) = gate(s) * pi_concept(a|c(s))
+              + (1-gate(s)) * pi_global(a)
     """
-    returns = []
-    final_rhos = []
-    
+
+    def __init__(self, gated_extractor, n_concepts=32, n_actions=4):
+        self.gated_extractor = gated_extractor
+        self.n_concepts      = n_concepts
+        self.n_actions       = n_actions
+        self.policy_table    = np.ones((n_concepts, n_actions)) / n_actions
+        self.global_policy   = np.ones(n_actions) / n_actions
+
+    def state_to_concept_index(self, state) -> int:
+        concept_vec = self.gated_extractor(state)
+        if len(concept_vec) > 5:
+            concept_vec = concept_vec[:5]
+        binary = (concept_vec > 0.5).astype(int)
+        return int(sum(b * (2**i) for i, b in enumerate(binary)))
+
+    def learn_from_trajectories(self, trajectories, smoothing=1.0):
+        counts = np.ones((self.n_concepts, self.n_actions)) * smoothing
+        for traj in trajectories:
+            for step in traj:
+                c = self.state_to_concept_index(step['state'])
+                counts[c, step['action']] += 1
+        self.policy_table = counts / counts.sum(axis=1, keepdims=True)
+        total = counts.sum(axis=0)
+        self.global_policy = total / total.sum()
+
+    def prob(self, state, action) -> float:
+        gate         = self.gated_extractor.get_gate_value(state)
+        c            = self.state_to_concept_index(state)
+        concept_prob = float(self.policy_table[c, action])
+        global_prob  = float(self.global_policy[action])
+        return gate * concept_prob + (1 - gate) * global_prob
+
+    def action_probs(self, state) -> np.ndarray:
+        gate          = self.gated_extractor.get_gate_value(state)
+        c             = self.state_to_concept_index(state)
+        return gate * self.policy_table[c] + (1 - gate) * self.global_policy
+
+
+def cpdis_estimate_by_horizon(trajectories, behavior_policy, eval_policy,
+                               max_horizon, gamma=0.99):
+    returns, final_rhos = [], []
     for traj in trajectories:
-        G = 0.0
-        rho_cumulative = 1.0
-        
-        # Only go up to max_horizon or trajectory length
-        T = min(len(traj), max_horizon)
-        
-        for t in range(T):
+        G, rho = 0.0, 1.0
+        for t in range(min(len(traj), max_horizon)):
             step = traj[t]
-            state = step['state']
-            action = step['action']
-            reward = step['reward']
-            
-            # Concept-based importance ratio
-            pi_e_c = eval_concept_policy.prob(state, action)
-            pi_b_c = behavior_concept_policy.prob(state, action)
-            
-            if pi_b_c < 1e-10:
-                rho_t = 0.0
-            else:
-                rho_t = pi_e_c / pi_b_c
-            
-            # THIS IS WHERE COMPOUNDING HAPPENS
-            rho_cumulative *= rho_t
-            
-            G += (gamma ** t) * rho_cumulative * reward
-        
+            pi_e = eval_policy.prob(step['state'], step['action'])
+            pi_b = behavior_policy.prob(step['state'], step['action'])
+            rho  *= (pi_e / pi_b) if pi_b > 1e-10 else 0.0
+            G    += (gamma ** t) * rho * step['reward']
         returns.append(G)
-        final_rhos.append(rho_cumulative)
-    
-    returns = np.array(returns)
+        final_rhos.append(rho)
+    returns    = np.array(returns)
     final_rhos = np.array(final_rhos)
-    
-    estimate = np.mean(returns)
-    variance = np.var(returns)
-    
-    # Effective sample size
-    if np.sum(final_rhos ** 2) > 0:
-        ess = (np.sum(final_rhos) ** 2) / np.sum(final_rhos ** 2)
-    else:
-        ess = 0
-    
-    return estimate, variance, ess
+    ess = (np.sum(final_rhos)**2 / np.sum(final_rhos**2)
+           if np.sum(final_rhos**2) > 0 else 0)
+    return float(np.mean(returns)), float(np.var(returns)), ess
 
 
-def pdis_estimate_by_horizon(
-    trajectories: List[List[Dict]],
-    behavior_policy,
-    eval_policy,
-    max_horizon: int,
-    gamma: float = 0.99
-) -> Tuple[float, float, float]:
-    """
-    Standard PDIS (state-based) up to a specific horizon.
-    """
-    returns = []
-    final_rhos = []
-    
+def pdis_estimate_by_horizon(trajectories, behavior_policy, eval_policy,
+                              max_horizon, gamma=0.99):
+    returns, final_rhos = [], []
     for traj in trajectories:
-        G = 0.0
-        rho_cumulative = 1.0
-        
-        T = min(len(traj), max_horizon)
-        
-        for t in range(T):
+        G, rho = 0.0, 1.0
+        for t in range(min(len(traj), max_horizon)):
             step = traj[t]
-            state = step['state']
-            action = step['action']
-            reward = step['reward']
-            
-            pi_e = eval_policy.prob(state, action)
-            pi_b = behavior_policy.prob(state, action)
-            
-            if pi_b < 1e-10:
-                rho_t = 0.0
-            else:
-                rho_t = pi_e / pi_b
-            
-            rho_cumulative *= rho_t
-            G += (gamma ** t) * rho_cumulative * reward
-        
+            pi_e = eval_policy.prob(step['state'], step['action'])
+            pi_b = behavior_policy.prob(step['state'], step['action'])
+            rho  *= (pi_e / pi_b) if pi_b > 1e-10 else 0.0
+            G    += (gamma ** t) * rho * step['reward']
         returns.append(G)
-        final_rhos.append(rho_cumulative)
-    
-    returns = np.array(returns)
+        final_rhos.append(rho)
+    returns    = np.array(returns)
     final_rhos = np.array(final_rhos)
-    
-    estimate = np.mean(returns)
-    variance = np.var(returns)
-    
-    if np.sum(final_rhos ** 2) > 0:
-        ess = (np.sum(final_rhos) ** 2) / np.sum(final_rhos ** 2)
-    else:
-        ess = 0
-    
-    return estimate, variance, ess
+    ess = (np.sum(final_rhos)**2 / np.sum(final_rhos**2)
+           if np.sum(final_rhos**2) > 0 else 0)
+    return float(np.mean(returns)), float(np.var(returns)), ess
 
 
-def compute_ground_truth_by_horizon(
-    env,
-    eval_policy,
-    max_horizon: int,
-    n_episodes: int = 2000,
-    gamma: float = 0.99
-) -> float:
-    """
-    Compute true policy value up to a specific horizon.
-    """
+def compute_ground_truth_by_horizon(env, eval_policy, max_horizon,
+                                    n_episodes=2000, gamma=0.99):
     returns = []
-    
     for _ in range(n_episodes):
         traj = collect_trajectory(env, eval_policy, max_steps=max_horizon)
-        G = sum((gamma ** t) * step['reward'] for t, step in enumerate(traj))
-        returns.append(G)
-    
-    return np.mean(returns)
+        returns.append(sum((gamma**t) * s['reward'] for t, s in enumerate(traj)))
+    return float(np.mean(returns))
 
 
 def run_fixed_experiment(
-    n_trajectories: int = 500,
-    max_steps: int = 50,
-    train_horizon: int = 10,
-    test_horizons: List[int] = None,
-    seed: int = 42,
-    behavior_epsilon: float = 0.4,
-    eval_epsilon: float = 0.05
+    n_trajectories=500, max_steps=50, train_horizon=10,
+    test_horizons=None, seed=42,
+    behavior_epsilon=0.4, eval_epsilon=0.05
 ) -> Dict:
-    """
-    The FIXED experiment that actually shows OPE error compounding.
-    """
+
     if test_horizons is None:
         test_horizons = [5, 10, 15, 20, 25, 30, 35, 40]
-    
+
     set_seed(seed)
-    
+
     print("=" * 70)
     print("FIXED EXPERIMENT: OPE Error Compounding")
     print("=" * 70)
-    
-    # Setup
-    env = WindyGridworld()
+
+    env             = WindyGridworld()
     behavior_policy = EpsilonGreedyPolicy(env, epsilon=behavior_epsilon, seed=seed)
-    eval_policy = OptimalPolicy(env, epsilon=eval_epsilon, seed=seed)
-    
+    eval_policy     = OptimalPolicy(env, epsilon=eval_epsilon, seed=seed)
+
     print(f"\n[1] Setup")
     print(f"    Behavior: ε-greedy (ε={behavior_epsilon})")
     print(f"    Evaluation: Optimal (ε={eval_epsilon})")
     print(f"    Train horizon: {train_horizon}")
-    
-    # Collect trajectories
+
+    # =========================================================================
+    # [2] Collect trajectories
+    # =========================================================================
     print(f"\n[2] Collecting {n_trajectories} trajectories...")
     trajectories = []
     for _ in range(n_trajectories):
-        traj = collect_trajectory(env, behavior_policy, max_steps=max_steps)
-        trajectories.append(traj)
+        trajectories.append(collect_trajectory(env, behavior_policy,
+                                               max_steps=max_steps))
     print_trajectory_stats(trajectories, "Data")
-    
-    # Setup concepts
+
+    # =========================================================================
+    # [3] Setup and train concepts
+    # =========================================================================
     print(f"\n[3] Setting up concepts...")
-    hard_concepts = HardConcepts(env)
-    soft_concepts = SoftConcepts(env, use_leakage=True, seed=seed)
-    
-    # Train soft concepts on early timesteps only
+    hard_concepts      = HardConcepts(env)
+    soft_concepts      = SoftConcepts(env, use_leakage=True, seed=seed)
+    gated_concepts     = GatedSoftConcepts(env, seed=seed)
+    conformal_concepts = ConformalGatedConcepts(env, seed=seed)
+
     train_trajs = []
     for traj in trajectories[:200]:
-        early_steps = [s for i, s in enumerate(traj) if i < train_horizon]
-        if len(early_steps) > 0:
-            train_trajs.append(early_steps)
-    
+        early = [s for i, s in enumerate(traj) if i < train_horizon]
+        if early:
+            train_trajs.append(early)
+
     print(f"    Training soft concepts on t < {train_horizon}...")
     soft_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200)
-    
+
+    print(f"    Training entropy-gated concepts on t < {train_horizon}...")
+    gated_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200)
+    print(f"    Entropy gated global mean: {gated_concepts.global_mean.round(3)}")
+
+    print(f"    Training conformal-gated concepts on t < {train_horizon}...")
+    conformal_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200)
+    print(f"    Conformal global mean: {conformal_concepts.global_mean.round(3)}")
+
     # =========================================================================
     # EXPERIMENT 1: Temporal Leakage Degradation
-    # Train probe on t < train_horizon, evaluate R² at each timestep
     # =========================================================================
     print(f"\n[3b] Experiment 1: Measuring temporal leakage degradation...")
-    
+
     from concepts import train_probe, evaluate_probe
-    
-    # Collect states and features by timestep
+
     leakage_timesteps = [2, 5, 10, 15, 20, 25, 30, 35, 40]
-    states_by_t = {t: [] for t in leakage_timesteps}
+    states_by_t   = {t: [] for t in leakage_timesteps}
     features_by_t = {t: [] for t in leakage_timesteps}
-    
+
     for traj in trajectories:
         for t, step in enumerate(traj):
             if t in states_by_t:
                 states_by_t[t].append(step['state'])
                 features_by_t[t].append(step['features'])
-    
-    # Train probes on early timesteps only (t < train_horizon)
-    train_states = []
-    train_features = []
+
+    train_states, train_features = [], []
     for t in leakage_timesteps:
         if t < train_horizon:
             train_states.extend(states_by_t[t])
             train_features.extend(features_by_t[t])
-    
+
     print(f"    Training probes on {len(train_states)} samples from t < {train_horizon}...")
-    probe_hard = train_probe(hard_concepts, train_states, train_features)
-    probe_soft = train_probe(soft_concepts, train_states, train_features)
-    
-    # Evaluate at each timestep
+    probe_soft  = train_probe(soft_concepts,  train_states, train_features)
+    probe_gated = train_probe(gated_concepts, train_states, train_features)
+
     leakage_results = {
         'timesteps': leakage_timesteps,
-        'hard_r2': [],
-        'soft_r2': [],
-        'n_samples': []
+        'hard_r2': [], 'soft_r2': [], 'gated_r2': [], 'n_samples': []
     }
-    
-    print(f"\n    {'Timestep':<10} {'In-Dist?':<10} {'Hard R²':<12} {'Soft R²':<12} {'N':<8}")
-    print("    " + "-" * 52)
-    
+
+    print(f"\n    {'Timestep':<10} {'In-Dist?':<10} {'Hard R²':<12} "
+          f"{'Soft R²':<12} {'Gated R²':<12} {'N':<8}")
+    print("    " + "-" * 64)
+
     for t in leakage_timesteps:
         if len(states_by_t[t]) < 10:
-            print(f"    t={t}: Skipping (only {len(states_by_t[t])} samples)")
             continue
-        
-        r2_hard = evaluate_probe(probe_hard, hard_concepts, states_by_t[t], features_by_t[t])
-        r2_soft = evaluate_probe(probe_soft, soft_concepts, states_by_t[t], features_by_t[t])
-        
-        in_dist = "Yes" if t < train_horizon else "No"
-        n_samples = len(states_by_t[t])
-        
+        r2_hard  = measure_leakage(hard_concepts,
+                                   np.array(states_by_t[t], dtype=object),
+                                   np.array(features_by_t[t]))
+        r2_soft  = evaluate_probe(probe_soft,  soft_concepts,
+                                  states_by_t[t], features_by_t[t])
+        r2_gated = evaluate_probe(probe_gated, gated_concepts,
+                                  states_by_t[t], features_by_t[t])
+        in_dist  = "Yes" if t < train_horizon else "No"
+        n        = len(states_by_t[t])
         leakage_results['hard_r2'].append(r2_hard)
         leakage_results['soft_r2'].append(r2_soft)
-        leakage_results['n_samples'].append(n_samples)
-        
-        print(f"    t={t:<8} {in_dist:<10} {r2_hard:<12.4f} {r2_soft:<12.4f} {n_samples:<8}")
-    
-    # Store leakage results
+        leakage_results['gated_r2'].append(r2_gated)
+        leakage_results['n_samples'].append(n)
+        print(f"    t={t:<8} {in_dist:<10} {r2_hard:<12.4f} "
+              f"{r2_soft:<12.4f} {r2_gated:<12.4f} {n:<8}")
+
+    # Gate values — entropy vs conformal
+    print("\n=== GATE VALUES OVER TIME ===")
+    print(f"\n{'t':<6} {'in-dist':<10} {'entropy gate':<15} {'conformal gate':<15}")
+    print("-" * 48)
+    for t in leakage_timesteps:
+        if len(states_by_t[t]) < 10:
+            continue
+        ge = np.mean([gated_concepts.get_gate_value(s)     for s in states_by_t[t]])
+        gc = np.mean([conformal_concepts.get_gate_value(s) for s in states_by_t[t]])
+        in_dist = "Yes" if t < train_horizon else "No"
+        print(f"{t:<6} {in_dist:<10} {ge:<15.3f} {gc:<15.3f}")
+
     results_leakage = leakage_results
-    
-    # Build concept-based policies
+
+    # =========================================================================
+    # [4] Build concept-based policies
+    # =========================================================================
     print(f"\n[4] Building concept-based policies...")
-    
-    # Hard concept policies (should work well)
-    hard_behavior_policy = ConceptBasedPolicy(hard_concepts, n_concepts=32, n_actions=4)
-    hard_eval_policy = ConceptBasedPolicy(hard_concepts, n_concepts=32, n_actions=4)
-    
-    # Soft concept policies (should degrade at OOD)
-    soft_behavior_policy = ConceptBasedPolicy(soft_concepts, n_concepts=32, n_actions=4)
-    soft_eval_policy = ConceptBasedPolicy(soft_concepts, n_concepts=32, n_actions=4)
-    
-    # Learn policies from data
-    # Behavior policies learn from behavior trajectories
+
+    hard_behavior_policy      = ConceptBasedPolicy(hard_concepts,      n_concepts=32, n_actions=4)
+    hard_eval_policy          = ConceptBasedPolicy(hard_concepts,      n_concepts=32, n_actions=4)
+    soft_behavior_policy      = ConceptBasedPolicy(soft_concepts,      n_concepts=32, n_actions=4)
+    soft_eval_policy          = ConceptBasedPolicy(soft_concepts,      n_concepts=32, n_actions=4)
+    gated_behavior_policy     = GatedConceptBasedPolicy(gated_concepts,     n_concepts=32, n_actions=4)
+    gated_eval_policy         = GatedConceptBasedPolicy(gated_concepts,     n_concepts=32, n_actions=4)
+    conformal_behavior_policy = GatedConceptBasedPolicy(conformal_concepts, n_concepts=32, n_actions=4)
+    conformal_eval_policy     = GatedConceptBasedPolicy(conformal_concepts, n_concepts=32, n_actions=4)
+
     hard_behavior_policy.learn_from_trajectories(trajectories)
     soft_behavior_policy.learn_from_trajectories(trajectories)
-    
-    # Eval policies learn from eval policy rollouts
+    gated_behavior_policy.learn_from_trajectories(trajectories)
+    conformal_behavior_policy.learn_from_trajectories(trajectories)
+
     print("    Collecting eval policy trajectories...")
     eval_trajectories = []
     for _ in range(200):
-        traj = collect_trajectory(env, eval_policy, max_steps=max_steps)
-        eval_trajectories.append(traj)
-    
+        eval_trajectories.append(collect_trajectory(env, eval_policy,
+                                                    max_steps=max_steps))
+
     hard_eval_policy.learn_from_trajectories(eval_trajectories)
     soft_eval_policy.learn_from_trajectories(eval_trajectories)
-    
-    # Run OPE at different horizons
+    gated_eval_policy.learn_from_trajectories(eval_trajectories)
+    conformal_eval_policy.learn_from_trajectories(eval_trajectories)
+
+    # =========================================================================
+    # [5] EXPERIMENTS 2 & 3: OPE error vs horizon
+    # =========================================================================
     print(f"\n[5] Running OPE at horizons: {test_horizons}")
-    
+
     results = {
-        'horizons': test_horizons,
-        'true_values': [],
-        'state_pdis': {'estimates': [], 'errors': [], 'variances': []},
-        'hard_cpdis': {'estimates': [], 'errors': [], 'variances': []},
-        'soft_cpdis': {'estimates': [], 'errors': [], 'variances': []},
+        'horizons':        test_horizons,
+        'true_values':     [],
+        'state_pdis':      {'estimates': [], 'errors': [], 'variances': []},
+        'hard_cpdis':      {'estimates': [], 'errors': [], 'variances': []},
+        'soft_cpdis':      {'estimates': [], 'errors': [], 'variances': []},
+        'gated_cpdis':     {'estimates': [], 'errors': [], 'variances': []},
+        'conformal_cpdis': {'estimates': [], 'errors': [], 'variances': []},
     }
-    
+
     for h in test_horizons:
         print(f"\n    Horizon T={h}:")
-        
-        # Ground truth at this horizon
-        true_val = compute_ground_truth_by_horizon(env, eval_policy, h, n_episodes=1000)
+
+        true_val = compute_ground_truth_by_horizon(env, eval_policy, h,
+                                                   n_episodes=1000)
         results['true_values'].append(true_val)
         print(f"      True value: {true_val:.4f}")
-        
-        # State-based PDIS
-        est, var, ess = pdis_estimate_by_horizon(
-            trajectories, behavior_policy, eval_policy, h
-        )
-        err = abs(est - true_val)
-        results['state_pdis']['estimates'].append(est)
-        results['state_pdis']['errors'].append(err)
-        results['state_pdis']['variances'].append(var)
-        print(f"      State PDIS:  est={est:.4f}, err={err:.4f}")
-        
-        # Hard concept CPDIS
-        est, var, ess = cpdis_estimate_by_horizon(
-            trajectories, hard_behavior_policy, hard_eval_policy, h
-        )
-        err = abs(est - true_val)
-        results['hard_cpdis']['estimates'].append(est)
-        results['hard_cpdis']['errors'].append(err)
-        results['hard_cpdis']['variances'].append(var)
-        print(f"      Hard CPDIS:  est={est:.4f}, err={err:.4f}")
-        
-        # Soft concept CPDIS
-        est, var, ess = cpdis_estimate_by_horizon(
-            trajectories, soft_behavior_policy, soft_eval_policy, h
-        )
-        err = abs(est - true_val)
-        results['soft_cpdis']['estimates'].append(est)
-        results['soft_cpdis']['errors'].append(err)
-        results['soft_cpdis']['variances'].append(var)
-        print(f"      Soft CPDIS:  est={est:.4f}, err={err:.4f}")
-    
-    # Add leakage results to output
+
+        for key, b_pol, e_pol, label in [
+            ('state_pdis',      behavior_policy,           eval_policy,           'State PDIS     '),
+            ('hard_cpdis',      hard_behavior_policy,      hard_eval_policy,      'Hard CPDIS     '),
+            ('soft_cpdis',      soft_behavior_policy,      soft_eval_policy,      'Soft CPDIS     '),
+            ('gated_cpdis',     gated_behavior_policy,     gated_eval_policy,     'Gated CPDIS    '),
+            ('conformal_cpdis', conformal_behavior_policy, conformal_eval_policy, 'Conformal CPDIS'),
+        ]:
+            fn = (pdis_estimate_by_horizon if key == 'state_pdis'
+                  else cpdis_estimate_by_horizon)
+            est, var, ess = fn(trajectories, b_pol, e_pol, h)
+            err = abs(est - true_val)
+            results[key]['estimates'].append(est)
+            results[key]['errors'].append(err)
+            results[key]['variances'].append(var)
+            print(f"      {label}: est={est:.4f}, err={err:.4f}")
+
     results['leakage'] = results_leakage
-    
     return results
 
 
-def plot_fixed_results(results: Dict, save_path: str = None):
-    """
-    Plot the key result: OPE error vs horizon for hard vs soft concepts.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-    
-    horizons = results['horizons']
-    
-    # Plot 1: OPE Error vs Horizon
-    ax1 = axes[0]
-    ax1.plot(horizons, results['state_pdis']['errors'], 'k-o', 
-             linewidth=2, markersize=8, label='State PDIS')
-    ax1.plot(horizons, results['hard_cpdis']['errors'], 'g-s', 
-             linewidth=2, markersize=8, label='Hard Concept CPDIS')
-    ax1.plot(horizons, results['soft_cpdis']['errors'], 'r-^', 
-             linewidth=2, markersize=8, label='Soft Concept CPDIS')
-    
-    ax1.set_xlabel('Trajectory Horizon T', fontsize=12)
-    ax1.set_ylabel('OPE Absolute Error', fontsize=12)
-    ax1.set_title('OPE Error vs Horizon', fontsize=14, fontweight='bold')
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-    ax1.axvline(x=10, color='gray', linestyle='--', alpha=0.5, label='Train horizon')
-    
-    # Plot 2: OPE Variance vs Horizon
-    ax2 = axes[1]
-    ax2.plot(horizons, results['state_pdis']['variances'], 'k-o', 
-             linewidth=2, markersize=8, label='State PDIS')
-    ax2.plot(horizons, results['hard_cpdis']['variances'], 'g-s', 
-             linewidth=2, markersize=8, label='Hard Concept CPDIS')
-    ax2.plot(horizons, results['soft_cpdis']['variances'], 'r-^', 
-             linewidth=2, markersize=8, label='Soft Concept CPDIS')
-    
-    ax2.set_xlabel('Trajectory Horizon T', fontsize=12)
-    ax2.set_ylabel('OPE Variance', fontsize=12)
-    ax2.set_title('OPE Variance vs Horizon', fontsize=14, fontweight='bold')
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_yscale('log')
-    ax2.axvline(x=10, color='gray', linestyle='--', alpha=0.5)
-    
-    # Plot 3: Leakage R² vs Timestep (Experiment 1)
-    ax3 = axes[2]
-    if 'leakage' in results:
-        leakage = results['leakage']
-        timesteps = leakage['timesteps'][:len(leakage['hard_r2'])]
-        
-        ax3.plot(timesteps, leakage['hard_r2'], 'g-s', 
-                 linewidth=2, markersize=8, label='Hard Concepts')
-        ax3.plot(timesteps, leakage['soft_r2'], 'r-^', 
-                 linewidth=2, markersize=8, label='Soft Concepts')
-        
-        ax3.set_xlabel('Timestep t', fontsize=12)
-        ax3.set_ylabel('Probe R² (Leakage)', fontsize=12)
-        ax3.set_title('Exp 1: Leakage vs Timestep', fontsize=14, fontweight='bold')
-        ax3.legend(fontsize=10)
-        ax3.grid(True, alpha=0.3)
-        ax3.axvline(x=10, color='gray', linestyle='--', alpha=0.5, label='Train horizon')
-        ax3.axhline(y=0, color='gray', linestyle='-', alpha=0.3)  # Zero line
-    
-    plt.tight_layout()
-    
+# =============================================================================
+# PLOTTING — three separate publication-quality figures
+# =============================================================================
+
+# Shared style constants
+_STYLE = {
+    'font.family':       'DejaVu Sans',
+    'font.size':         13,
+    'axes.titlesize':    15,
+    'axes.titleweight':  'bold',
+    'axes.labelsize':    13,
+    'axes.spines.top':   False,
+    'axes.spines.right': False,
+    'axes.linewidth':    1.3,
+    'axes.grid':         True,
+    'grid.alpha':        0.22,
+    'grid.linestyle':    '--',
+    'xtick.direction':   'out',
+    'ytick.direction':   'out',
+    'legend.framealpha': 0.92,
+    'legend.edgecolor':  '#cccccc',
+    'legend.fontsize':   11,
+    'lines.linewidth':   2.4,
+    'lines.markersize':  8,
+    'figure.dpi':        150,
+}
+
+# Colourblind-friendly palette
+C = {
+    'hard':    '#27ae60',   # green
+    'soft':    '#e74c3c',   # red
+    'entropy': '#2980b9',   # blue
+    'conf':    '#8e44ad',   # purple
+    'state':   '#2c3e50',   # charcoal
+    'vline':   '#7f8c8d',   # grey
+    'in_bg':   '#f4faf5',   # light green tint
+    'ood_bg':  '#fdf4f4',   # light red tint
+}
+
+TRAIN_H = 10
+
+
+def _shade_regions(ax, x_min, x_max):
+    """Add in-dist / OOD shaded background."""
+    ax.axvspan(x_min, TRAIN_H,  color=C['in_bg'],  alpha=1.0, zorder=0)
+    ax.axvspan(TRAIN_H, x_max,  color=C['ood_bg'],  alpha=1.0, zorder=0)
+    ax.axvline(x=TRAIN_H, color=C['vline'], ls='--', lw=1.6,
+               label=f'Train horizon (t={TRAIN_H})', zorder=2)
+
+
+def _region_labels(ax, x_min, x_max, y_frac=0.94):
+    """Add italic region labels inside the shaded areas."""
+    ylim = ax.get_ylim()
+    y    = ylim[0] + (ylim[1] - ylim[0]) * y_frac
+    ax.text((x_min + TRAIN_H) / 2, y,
+            'In-distribution', ha='center', fontsize=10,
+            color='#1a6b35', style='italic', zorder=5)
+    ax.text(TRAIN_H + (x_max - TRAIN_H) / 2, y,
+            'Out-of-distribution', ha='center', fontsize=10,
+            color='#a93226', style='italic', zorder=5)
+
+
+def plot_exp1_leakage(results, save_path=None):
+    """Figure 1 — Experiment 1: Leakage R² vs Timestep."""
+    plt.rcParams.update(_STYLE)
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    lk = results.get('leakage', {})
+    ts = lk.get('timesteps', [])
+    ts = ts[:len(lk.get('hard_r2', []))]
+
+    _shade_regions(ax, min(ts), max(ts))
+
+    ax.plot(ts, lk['hard_r2'], color=C['hard'], marker='s', zorder=3,
+            label='Hard Concepts (rule-based)')
+    ax.plot(ts, lk['soft_r2'], color=C['soft'], marker='^', zorder=3,
+            label='Soft Concepts (neural network)')
+
+    ax.axhline(y=0, color='#aaaaaa', ls='-', lw=1.0, zorder=1)
+
+    ax.set_xlabel('Trajectory Timestep  $t$')
+    ax.set_ylabel('Linear Probe  $R^2$')
+    ax.set_title('Exp 1 — Temporal Leakage Degradation')
+    ax.legend(loc='lower left')
+
+    fig.tight_layout()
+    _region_labels(ax, min(ts), max(ts))
+
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"\nPlot saved to: {save_path}")
-    
-    plt.show()
-    
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+    return fig
+
+
+def plot_exp2_ope(results, save_path=None):
+    """Figure 2 — Experiment 2: OPE Error vs Horizon (hard vs soft only)."""
+    plt.rcParams.update(_STYLE)
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    H = results['horizons']
+    _shade_regions(ax, min(H), max(H))
+
+    ax.plot(H, results['hard_cpdis']['errors'], color=C['hard'], marker='s',
+            zorder=3, label='Hard Concept CPDIS')
+    ax.plot(H, results['soft_cpdis']['errors'], color=C['soft'], marker='^',
+            zorder=3, label='Soft Concept CPDIS')
+
+    ax.set_xlabel('Trajectory Horizon  $H$')
+    ax.set_ylabel('OPE Absolute Error')
+    ax.set_title('Exp 2 — Leakage Poisoning Compounds Over Horizon')
+    ax.legend(loc='upper left')
+
+    fig.tight_layout()
+    _region_labels(ax, min(H), max(H))
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
+    return fig
+
+
+def plot_exp3_conformal(results, save_path=None):
+    """Figure 3 — Experiment 3: OPE Error vs Horizon (all 4 estimators)."""
+    plt.rcParams.update(_STYLE)
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    H = results['horizons']
+    _shade_regions(ax, min(H), max(H))
+
+    ax.plot(H, results['hard_cpdis']['errors'],      color=C['hard'],    marker='s',
+            zorder=3, label='Hard Concept CPDIS')
+    ax.plot(H, results['soft_cpdis']['errors'],      color=C['soft'],    marker='^',
+            zorder=3, label='Soft Concept CPDIS')
+    ax.plot(H, results['gated_cpdis']['errors'],     color=C['entropy'], marker='o',
+            zorder=3, label='Gated CPDIS (Entropy)')
+    ax.plot(H, results['conformal_cpdis']['errors'], color=C['conf'],    marker='D',
+            zorder=3, label='Gated CPDIS (Conformal)')
+
+    ax.set_xlabel('Trajectory Horizon  $H$')
+    ax.set_ylabel('OPE Absolute Error')
+    ax.set_title('Exp 3 — Conformal Gating Reduces Leakage Poisoning')
+    ax.legend(loc='upper left')
+
+    fig.tight_layout()
+    _region_labels(ax, min(H), max(H))
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"  Saved: {save_path}")
     return fig
 
 
 if __name__ == "__main__":
     results_dir = os.path.join(project_root, 'results')
     os.makedirs(results_dir, exist_ok=True)
-    
-    # Run the fixed experiment
+
     results = run_fixed_experiment(
-        n_trajectories=500,
-        max_steps=50,
-        train_horizon=10,
-        test_horizons=[5, 10, 15, 20, 25, 30, 35, 40],
-        seed=42
+        n_trajectories=500, max_steps=50, train_horizon=10,
+        test_horizons=[5, 10, 15, 20, 25, 30, 35, 40], seed=42
     )
-    
-    # Print summary
+
     print("\n" + "=" * 70)
     print("SUMMARY: OPE Error at Each Horizon")
     print("=" * 70)
-    print(f"\n{'Horizon':<10} {'True Val':<12} {'State Err':<12} {'Hard Err':<12} {'Soft Err':<12}")
-    print("-" * 60)
-    
+    print(f"\n{'H':<6} {'True':<10} {'Hard':<10} {'Soft':<10} "
+          f"{'Entropy gate':<15} {'Conformal gate':<15}")
+    print("-" * 68)
+
     for i, h in enumerate(results['horizons']):
-        true_val = results['true_values'][i]
-        state_err = results['state_pdis']['errors'][i]
-        hard_err = results['hard_cpdis']['errors'][i]
-        soft_err = results['soft_cpdis']['errors'][i]
-        print(f"{h:<10} {true_val:<12.4f} {state_err:<12.4f} {hard_err:<12.4f} {soft_err:<12.4f}")
-    
-    # Plot results
-    plot_fixed_results(results, save_path=os.path.join(results_dir, 'ope_error_compounding.png'))
-    
-    # Save results
+        print(f"{h:<6} {results['true_values'][i]:<10.4f} "
+              f"{results['hard_cpdis']['errors'][i]:<10.4f} "
+              f"{results['soft_cpdis']['errors'][i]:<10.4f} "
+              f"{results['gated_cpdis']['errors'][i]:<15.4f} "
+              f"{results['conformal_cpdis']['errors'][i]:<15.4f}")
+
+    print("\nGenerating plots...")
+    plot_exp1_leakage(results,
+                      save_path=os.path.join(results_dir, 'exp1_leakage.png'))
+    plot_exp2_ope(results,
+                  save_path=os.path.join(results_dir, 'exp2_ope_error.png'))
+    plot_exp3_conformal(results,
+                        save_path=os.path.join(results_dir, 'exp3_conformal_fix.png'))
+
+    plt.show()
+
     np.save(os.path.join(results_dir, 'fixed_experiment_results.npy'), results)
     print(f"\nResults saved to {results_dir}/")
