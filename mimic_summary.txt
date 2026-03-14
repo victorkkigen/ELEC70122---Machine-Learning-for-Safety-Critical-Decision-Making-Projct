@@ -1,0 +1,26 @@
+MIMIC-III Demo Dataset Summary
+==================================================
+
+Number of trajectories: 133
+Mortality rate: 32.3%
+Mean trajectory length: 13.5 time bins
+Time bin size: 4.0 hours
+Number of features: 15
+Number of actions: 25
+
+Feature coverage (% of trajectories with data):
+  creatinine: 100.0%
+  fio2: 55.6%
+  lactate: 72.9%
+  pao2: 70.7%
+  paco2: 70.7%
+  urine: 97.0%
+  gcs: 97.7%
+  calcium: 97.7%
+  chloride: 100.0%
+  glucose: 100.0%
+  hco3: 100.0%
+  magnesium: 98.5%
+  potassium: 100.0%
+  sodium: 100.0%
+  spo2: 97.7%

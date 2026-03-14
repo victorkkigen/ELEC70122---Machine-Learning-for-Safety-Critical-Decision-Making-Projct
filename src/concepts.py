@@ -306,6 +306,67 @@ def measure_leakage(concept_extractor, states: np.ndarray,
         return 0.0
 
 
+def train_probe(concept_extractor, states, features):
+    """
+    Train a linear probe to predict raw features from concept embeddings.
+    
+    Args:
+        concept_extractor: HardConcepts or SoftConcepts instance
+        states: List of states to train on
+        features: Corresponding raw feature vectors (n_samples, n_features)
+    
+    Returns:
+        Fitted Ridge regression probe
+    """
+    from sklearn.linear_model import Ridge
+    
+    # Extract concept embeddings
+    embeddings = []
+    for state in states:
+        if isinstance(state, np.ndarray):
+            state = tuple(state)
+        emb = concept_extractor(state)
+        embeddings.append(emb)
+    
+    embeddings = np.array(embeddings)
+    features = np.array(features)
+    
+    # Fit linear probe
+    probe = Ridge(alpha=1.0)
+    probe.fit(embeddings, features)
+    
+    return probe
+
+
+def evaluate_probe(probe, concept_extractor, states, features):
+    """
+    Evaluate a trained probe on new data.
+    
+    Args:
+        probe: Fitted Ridge regression probe from train_probe()
+        concept_extractor: HardConcepts or SoftConcepts instance
+        states: List of states to evaluate on
+        features: Corresponding raw feature vectors
+    
+    Returns:
+        R² score (higher = more leakage, negative = worse than baseline)
+    """
+    # Extract concept embeddings
+    embeddings = []
+    for state in states:
+        if isinstance(state, np.ndarray):
+            state = tuple(state)
+        emb = concept_extractor(state)
+        embeddings.append(emb)
+    
+    embeddings = np.array(embeddings)
+    features = np.array(features)
+    
+    # Compute R² (can be negative if probe fails badly on OOD data)
+    r2 = probe.score(embeddings, features)
+    return r2  # Don't clamp - negative R² is informative
+
+
 if __name__ == "__main__":
     from gridworld import WindyGridworld, collect_trajectory
     from policies import EpsilonGreedyPolicy

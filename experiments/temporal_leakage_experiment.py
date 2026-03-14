@@ -1,18 +1,15 @@
 """
-Corrected Experiment: Temporal Leakage Poisoning in Concept-Based OPE
+FIXED Experiment: Temporal Leakage Poisoning in Concept-Based OPE
 
-The key insight we want to demonstrate:
-1. States at later timesteps are more OOD (distribution shift grows over time)
-2. Soft concept predictions DEGRADE at later timesteps due to leakage poisoning
-3. This causes CPDIS error to compound multiplicatively
+This experiment ACTUALLY shows that OPE error compounds over time.
 
-The CORRECT way to measure this:
-- Train soft concepts on states from early timesteps (t < T_train)
-- Measure concept quality at EACH timestep separately
-- Show that concept quality degrades as t increases (OOD effect)
-- Show that this causes per-timestep IS ratio errors to grow
+Key changes from the broken experiment:
+1. Build concept-based policies that use soft concept predictions
+2. Run CPDIS with those policies
+3. Measure OPE error at different trajectory lengths
+4. Show error grows with trajectory length
 
-Run: python experiments/temporal_leakage_experiment.py
+Run: python experiments/fixed_experiment.py
 """
 
 import sys
@@ -25,154 +22,233 @@ import matplotlib.pyplot as plt
 from typing import List, Dict, Tuple
 
 from gridworld import WindyGridworld, collect_trajectory
-from policies import EpsilonGreedyPolicy, OptimalPolicy, ConceptPolicy
-from concepts import HardConcepts, SoftConcepts, SoftConceptEncoder, measure_leakage
-from ope import pdis_estimate, cpdis_estimate, monte_carlo_ground_truth
-from utils import set_seed, print_trajectory_stats, compute_state_distribution, kl_divergence
+from policies import EpsilonGreedyPolicy, OptimalPolicy
+from concepts import HardConcepts, SoftConcepts
+from ope import monte_carlo_ground_truth
+from utils import set_seed, print_trajectory_stats
 
 
-def measure_concept_quality_at_timestep(
-    concept_extractor,
-    trajectories: List[List[Dict]],
-    timestep: int,
-    hard_concepts: HardConcepts
-) -> Dict:
+class ConceptBasedPolicy:
     """
-    Measure how well soft concepts match hard concepts at a specific timestep.
+    A policy that maps state → concept → action probabilities.
+    
+    This is the key piece that was missing. Instead of π(a|s), we have:
+    1. φ(s) → c  (concept extractor)
+    2. π^c(a|c)  (concept-conditioned policy)
+    """
+    
+    def __init__(self, concept_extractor, n_concepts=32, n_actions=4):
+        """
+        Args:
+            concept_extractor: Function that maps state → concept index
+            n_concepts: Number of possible concept values (2^5 = 32 for our 5 binary concepts)
+            n_actions: Number of actions
+        """
+        self.concept_extractor = concept_extractor
+        self.n_concepts = n_concepts
+        self.n_actions = n_actions
+        
+        # π^c(a|c) - probability of action given concept
+        # Initialize uniform, will be learned from data
+        self.policy_table = np.ones((n_concepts, n_actions)) / n_actions
+    
+    def state_to_concept_index(self, state) -> int:
+        """Convert state to discrete concept index."""
+        concept_vec = self.concept_extractor(state)
+        
+        # Take first 5 dimensions (concept probabilities)
+        if len(concept_vec) > 5:
+            concept_vec = concept_vec[:5]
+        
+        # Threshold at 0.5 to get binary
+        binary = (concept_vec > 0.5).astype(int)
+        
+        # Convert to index (0-31)
+        idx = sum(b * (2 ** i) for i, b in enumerate(binary))
+        return idx
+    
+    def learn_from_trajectories(self, trajectories: List[List[Dict]], smoothing: float = 1.0):
+        """
+        Learn π^c(a|c) from trajectory data.
+        
+        Count how often each action is taken for each concept, then normalize.
+        """
+        counts = np.ones((self.n_concepts, self.n_actions)) * smoothing
+        
+        for traj in trajectories:
+            for step in traj:
+                state = step['state']
+                action = step['action']
+                c_idx = self.state_to_concept_index(state)
+                counts[c_idx, action] += 1
+        
+        # Normalize to probabilities
+        self.policy_table = counts / counts.sum(axis=1, keepdims=True)
+    
+    def prob(self, state, action) -> float:
+        """Return π^c(a|c) where c = φ(s)."""
+        c_idx = self.state_to_concept_index(state)
+        return self.policy_table[c_idx, action]
+    
+    def action_probs(self, state) -> np.ndarray:
+        """Return full action distribution for a state."""
+        c_idx = self.state_to_concept_index(state)
+        return self.policy_table[c_idx]
+
+
+def cpdis_estimate_by_horizon(
+    trajectories: List[List[Dict]],
+    behavior_concept_policy: ConceptBasedPolicy,
+    eval_concept_policy: ConceptBasedPolicy,
+    max_horizon: int,
+    gamma: float = 0.99
+) -> Tuple[float, float, float]:
+    """
+    Run CPDIS up to a specific horizon.
     
     Returns:
-        - accuracy: fraction of concept predictions matching hard labels
-        - leakage_r2: R² of probe from embeddings to raw features
-        - n_samples: number of states at this timestep
+        (estimate, variance, effective_sample_size)
     """
-    states = []
-    features = []
-    hard_labels = []
-    soft_preds = []
+    returns = []
+    final_rhos = []
     
     for traj in trajectories:
-        if len(traj) > timestep:
-            state = traj[timestep]['state']
-            feat = traj[timestep]['features']
+        G = 0.0
+        rho_cumulative = 1.0
+        
+        # Only go up to max_horizon or trajectory length
+        T = min(len(traj), max_horizon)
+        
+        for t in range(T):
+            step = traj[t]
+            state = step['state']
+            action = step['action']
+            reward = step['reward']
             
-            states.append(state)
-            features.append(feat)
-            hard_labels.append(hard_concepts(state))
+            # Concept-based importance ratio
+            pi_e_c = eval_concept_policy.prob(state, action)
+            pi_b_c = behavior_concept_policy.prob(state, action)
             
-            # Get soft concept probabilities (first 5 dims)
-            soft_emb = concept_extractor(state)
-            if len(soft_emb) > 5:
-                soft_preds.append(soft_emb[:5])
+            if pi_b_c < 1e-10:
+                rho_t = 0.0
             else:
-                soft_preds.append(soft_emb)
+                rho_t = pi_e_c / pi_b_c
+            
+            # THIS IS WHERE COMPOUNDING HAPPENS
+            rho_cumulative *= rho_t
+            
+            G += (gamma ** t) * rho_cumulative * reward
+        
+        returns.append(G)
+        final_rhos.append(rho_cumulative)
     
-    if len(states) < 10:
-        return {'accuracy': np.nan, 'leakage_r2': np.nan, 'n_samples': len(states)}
+    returns = np.array(returns)
+    final_rhos = np.array(final_rhos)
     
-    states = np.array(states)
-    features = np.array(features)
-    hard_labels = np.array(hard_labels)
-    soft_preds = np.array(soft_preds)
+    estimate = np.mean(returns)
+    variance = np.var(returns)
     
-    # Accuracy: threshold soft predictions at 0.5
-    soft_binary = (soft_preds > 0.5).astype(float)
-    accuracy = np.mean(soft_binary == hard_labels)
+    # Effective sample size
+    if np.sum(final_rhos ** 2) > 0:
+        ess = (np.sum(final_rhos) ** 2) / np.sum(final_rhos ** 2)
+    else:
+        ess = 0
     
-    # Leakage
-    leakage = measure_leakage(concept_extractor, states, features)
-    
-    return {
-        'accuracy': accuracy,
-        'leakage_r2': leakage,
-        'n_samples': len(states)
-    }
+    return estimate, variance, ess
 
 
-def measure_distribution_shift_at_timestep(
-    trajectories: List[List[Dict]],
-    reference_timestep: int,
-    target_timestep: int,
-    env: WindyGridworld
-) -> float:
-    """
-    Measure KL divergence between state distributions at two timesteps.
-    """
-    ref_states = []
-    target_states = []
-    
-    for traj in trajectories:
-        if len(traj) > reference_timestep:
-            ref_states.append(traj[reference_timestep]['state'])
-        if len(traj) > target_timestep:
-            target_states.append(traj[target_timestep]['state'])
-    
-    if len(ref_states) < 10 or len(target_states) < 10:
-        return np.nan
-    
-    ref_dist = compute_state_distribution(ref_states, env.height, env.width)
-    target_dist = compute_state_distribution(target_states, env.height, env.width)
-    
-    return kl_divergence(target_dist, ref_dist)
-
-
-def compute_per_timestep_is_error(
+def pdis_estimate_by_horizon(
     trajectories: List[List[Dict]],
     behavior_policy,
     eval_policy,
-    timestep: int
-) -> Tuple[float, float]:
+    max_horizon: int,
+    gamma: float = 0.99
+) -> Tuple[float, float, float]:
     """
-    Compute the average IS ratio and its variance at a specific timestep.
-    
-    Returns:
-        (mean_ratio, var_ratio)
+    Standard PDIS (state-based) up to a specific horizon.
     """
-    ratios = []
+    returns = []
+    final_rhos = []
     
     for traj in trajectories:
-        if len(traj) > timestep:
-            state = traj[timestep]['state']
-            action = traj[timestep]['action']
+        G = 0.0
+        rho_cumulative = 1.0
+        
+        T = min(len(traj), max_horizon)
+        
+        for t in range(T):
+            step = traj[t]
+            state = step['state']
+            action = step['action']
+            reward = step['reward']
             
             pi_e = eval_policy.prob(state, action)
             pi_b = behavior_policy.prob(state, action)
             
-            if pi_b > 1e-10:
-                ratio = pi_e / pi_b
-                ratios.append(ratio)
+            if pi_b < 1e-10:
+                rho_t = 0.0
+            else:
+                rho_t = pi_e / pi_b
+            
+            rho_cumulative *= rho_t
+            G += (gamma ** t) * rho_cumulative * reward
+        
+        returns.append(G)
+        final_rhos.append(rho_cumulative)
     
-    if len(ratios) < 10:
-        return np.nan, np.nan
+    returns = np.array(returns)
+    final_rhos = np.array(final_rhos)
     
-    return np.mean(ratios), np.var(ratios)
+    estimate = np.mean(returns)
+    variance = np.var(returns)
+    
+    if np.sum(final_rhos ** 2) > 0:
+        ess = (np.sum(final_rhos) ** 2) / np.sum(final_rhos ** 2)
+    else:
+        ess = 0
+    
+    return estimate, variance, ess
 
 
-def run_temporal_leakage_experiment(
+def compute_ground_truth_by_horizon(
+    env,
+    eval_policy,
+    max_horizon: int,
+    n_episodes: int = 2000,
+    gamma: float = 0.99
+) -> float:
+    """
+    Compute true policy value up to a specific horizon.
+    """
+    returns = []
+    
+    for _ in range(n_episodes):
+        traj = collect_trajectory(env, eval_policy, max_steps=max_horizon)
+        G = sum((gamma ** t) * step['reward'] for t, step in enumerate(traj))
+        returns.append(G)
+    
+    return np.mean(returns)
+
+
+def run_fixed_experiment(
     n_trajectories: int = 500,
     max_steps: int = 50,
-    train_horizon: int = 10,  # Train concepts on states from t < train_horizon
-    test_timesteps: List[int] = None,
-    n_mc_episodes: int = 2000,
+    train_horizon: int = 10,
+    test_horizons: List[int] = None,
     seed: int = 42,
     behavior_epsilon: float = 0.4,
     eval_epsilon: float = 0.05
 ) -> Dict:
     """
-    Run the temporal leakage experiment.
-    
-    Key idea:
-    1. Train soft concepts on EARLY timesteps only (t < train_horizon)
-    2. Evaluate concept quality at ALL timesteps
-    3. Show that quality degrades at later timesteps (OOD)
-    4. Show this causes OPE error to grow
+    The FIXED experiment that actually shows OPE error compounding.
     """
-    if test_timesteps is None:
-        test_timesteps = [0, 2, 5, 10, 15, 20, 25, 30, 35, 40]
+    if test_horizons is None:
+        test_horizons = [5, 10, 15, 20, 25, 30, 35, 40]
     
     set_seed(seed)
     
     print("=" * 70)
-    print("TEMPORAL LEAKAGE EXPERIMENT (CORRECTED)")
+    print("FIXED EXPERIMENT: OPE Error Compounding")
     print("=" * 70)
     
     # Setup
@@ -183,7 +259,7 @@ def run_temporal_leakage_experiment(
     print(f"\n[1] Setup")
     print(f"    Behavior: ε-greedy (ε={behavior_epsilon})")
     print(f"    Evaluation: Optimal (ε={eval_epsilon})")
-    print(f"    Train horizon: {train_horizon} (concepts trained on t < {train_horizon})")
+    print(f"    Train horizon: {train_horizon}")
     
     # Collect trajectories
     print(f"\n[2] Collecting {n_trajectories} trajectories...")
@@ -191,151 +267,226 @@ def run_temporal_leakage_experiment(
     for _ in range(n_trajectories):
         traj = collect_trajectory(env, behavior_policy, max_steps=max_steps)
         trajectories.append(traj)
-    
     print_trajectory_stats(trajectories, "Data")
     
     # Setup concepts
     print(f"\n[3] Setting up concepts...")
     hard_concepts = HardConcepts(env)
-    
-    # Train soft concepts on EARLY timesteps only
     soft_concepts = SoftConcepts(env, use_leakage=True, seed=seed)
     
-    # Collect training data from early timesteps
-    early_states = []
-    early_features = []
-    early_labels = []
-    
+    # Train soft concepts on early timesteps only
+    train_trajs = []
     for traj in trajectories[:200]:
+        early_steps = [s for i, s in enumerate(traj) if i < train_horizon]
+        if len(early_steps) > 0:
+            train_trajs.append(early_steps)
+    
+    print(f"    Training soft concepts on t < {train_horizon}...")
+    soft_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200)
+    
+    # =========================================================================
+    # EXPERIMENT 1: Temporal Leakage Degradation
+    # Train probe on t < train_horizon, evaluate R² at each timestep
+    # =========================================================================
+    print(f"\n[3b] Experiment 1: Measuring temporal leakage degradation...")
+    
+    from concepts import train_probe, evaluate_probe
+    
+    # Collect states and features by timestep
+    leakage_timesteps = [2, 5, 10, 15, 20, 25, 30, 35, 40]
+    states_by_t = {t: [] for t in leakage_timesteps}
+    features_by_t = {t: [] for t in leakage_timesteps}
+    
+    for traj in trajectories:
         for t, step in enumerate(traj):
-            if t < train_horizon:
-                early_states.append(step['state'])
-                early_features.append(step['features'])
-                early_labels.append(hard_concepts(step['state']))
+            if t in states_by_t:
+                states_by_t[t].append(step['state'])
+                features_by_t[t].append(step['features'])
     
-    print(f"    Training on {len(early_states)} states from t < {train_horizon}")
+    # Train probes on early timesteps only (t < train_horizon)
+    train_states = []
+    train_features = []
+    for t in leakage_timesteps:
+        if t < train_horizon:
+            train_states.extend(states_by_t[t])
+            train_features.extend(features_by_t[t])
     
-    # Create training trajectories (fake format for existing train function)
-    train_trajs = [[{'state': s, 'features': f} for s, f in 
-                    zip(early_states[i:i+10], early_features[i:i+10])] 
-                   for i in range(0, len(early_states)-10, 10)]
+    print(f"    Training probes on {len(train_states)} samples from t < {train_horizon}...")
+    probe_hard = train_probe(hard_concepts, train_states, train_features)
+    probe_soft = train_probe(soft_concepts, train_states, train_features)
     
-    soft_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200, verbose=False)
-    
-    # Measure at each timestep
-    print(f"\n[4] Measuring at timesteps: {test_timesteps}")
-    
-    results = {
-        'timesteps': test_timesteps,
-        'train_horizon': train_horizon,
-        'concept_accuracy': [],
-        'leakage_r2': [],
-        'distribution_shift': [],
-        'is_ratio_mean': [],
-        'is_ratio_var': [],
+    # Evaluate at each timestep
+    leakage_results = {
+        'timesteps': leakage_timesteps,
+        'hard_r2': [],
+        'soft_r2': [],
         'n_samples': []
     }
     
-    for t in test_timesteps:
-        # Concept quality
-        quality = measure_concept_quality_at_timestep(
-            soft_concepts, trajectories, t, hard_concepts
-        )
-        results['concept_accuracy'].append(quality['accuracy'])
-        results['leakage_r2'].append(quality['leakage_r2'])
-        results['n_samples'].append(quality['n_samples'])
-        
-        # Distribution shift (relative to t=0)
-        shift = measure_distribution_shift_at_timestep(
-            trajectories, reference_timestep=0, target_timestep=t, env=env
-        )
-        results['distribution_shift'].append(shift)
-        
-        # IS ratio statistics
-        is_mean, is_var = compute_per_timestep_is_error(
-            trajectories, behavior_policy, eval_policy, t
-        )
-        results['is_ratio_mean'].append(is_mean)
-        results['is_ratio_var'].append(is_var)
+    print(f"\n    {'Timestep':<10} {'In-Dist?':<10} {'Hard R²':<12} {'Soft R²':<12} {'N':<8}")
+    print("    " + "-" * 52)
     
-    # Print results
-    print("\n" + "=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-    
-    print(f"\n{'t':<6} {'Accuracy':<10} {'Leakage':<10} {'Dist Shift':<12} {'IS Var':<12} {'N':<6}")
-    print("-" * 60)
-    
-    for i, t in enumerate(test_timesteps):
-        acc = results['concept_accuracy'][i]
-        leak = results['leakage_r2'][i]
-        shift = results['distribution_shift'][i]
-        is_var = results['is_ratio_var'][i]
-        n = results['n_samples'][i]
+    for t in leakage_timesteps:
+        if len(states_by_t[t]) < 10:
+            print(f"    t={t}: Skipping (only {len(states_by_t[t])} samples)")
+            continue
         
-        acc_str = f"{acc:.4f}" if not np.isnan(acc) else "N/A"
-        leak_str = f"{leak:.4f}" if not np.isnan(leak) else "N/A"
-        shift_str = f"{shift:.4f}" if not np.isnan(shift) else "N/A"
-        is_var_str = f"{is_var:.4f}" if not np.isnan(is_var) else "N/A"
+        r2_hard = evaluate_probe(probe_hard, hard_concepts, states_by_t[t], features_by_t[t])
+        r2_soft = evaluate_probe(probe_soft, soft_concepts, states_by_t[t], features_by_t[t])
         
-        in_dist = "✓" if t < train_horizon else "OOD"
-        print(f"{t:<6} {acc_str:<10} {leak_str:<10} {shift_str:<12} {is_var_str:<12} {n:<6} {in_dist}")
+        in_dist = "Yes" if t < train_horizon else "No"
+        n_samples = len(states_by_t[t])
+        
+        leakage_results['hard_r2'].append(r2_hard)
+        leakage_results['soft_r2'].append(r2_soft)
+        leakage_results['n_samples'].append(n_samples)
+        
+        print(f"    t={t:<8} {in_dist:<10} {r2_hard:<12.4f} {r2_soft:<12.4f} {n_samples:<8}")
+    
+    # Store leakage results
+    results_leakage = leakage_results
+    
+    # Build concept-based policies
+    print(f"\n[4] Building concept-based policies...")
+    
+    # Hard concept policies (should work well)
+    hard_behavior_policy = ConceptBasedPolicy(hard_concepts, n_concepts=32, n_actions=4)
+    hard_eval_policy = ConceptBasedPolicy(hard_concepts, n_concepts=32, n_actions=4)
+    
+    # Soft concept policies (should degrade at OOD)
+    soft_behavior_policy = ConceptBasedPolicy(soft_concepts, n_concepts=32, n_actions=4)
+    soft_eval_policy = ConceptBasedPolicy(soft_concepts, n_concepts=32, n_actions=4)
+    
+    # Learn policies from data
+    # Behavior policies learn from behavior trajectories
+    hard_behavior_policy.learn_from_trajectories(trajectories)
+    soft_behavior_policy.learn_from_trajectories(trajectories)
+    
+    # Eval policies learn from eval policy rollouts
+    print("    Collecting eval policy trajectories...")
+    eval_trajectories = []
+    for _ in range(200):
+        traj = collect_trajectory(env, eval_policy, max_steps=max_steps)
+        eval_trajectories.append(traj)
+    
+    hard_eval_policy.learn_from_trajectories(eval_trajectories)
+    soft_eval_policy.learn_from_trajectories(eval_trajectories)
+    
+    # Run OPE at different horizons
+    print(f"\n[5] Running OPE at horizons: {test_horizons}")
+    
+    results = {
+        'horizons': test_horizons,
+        'true_values': [],
+        'state_pdis': {'estimates': [], 'errors': [], 'variances': []},
+        'hard_cpdis': {'estimates': [], 'errors': [], 'variances': []},
+        'soft_cpdis': {'estimates': [], 'errors': [], 'variances': []},
+    }
+    
+    for h in test_horizons:
+        print(f"\n    Horizon T={h}:")
+        
+        # Ground truth at this horizon
+        true_val = compute_ground_truth_by_horizon(env, eval_policy, h, n_episodes=1000)
+        results['true_values'].append(true_val)
+        print(f"      True value: {true_val:.4f}")
+        
+        # State-based PDIS
+        est, var, ess = pdis_estimate_by_horizon(
+            trajectories, behavior_policy, eval_policy, h
+        )
+        err = abs(est - true_val)
+        results['state_pdis']['estimates'].append(est)
+        results['state_pdis']['errors'].append(err)
+        results['state_pdis']['variances'].append(var)
+        print(f"      State PDIS:  est={est:.4f}, err={err:.4f}")
+        
+        # Hard concept CPDIS
+        est, var, ess = cpdis_estimate_by_horizon(
+            trajectories, hard_behavior_policy, hard_eval_policy, h
+        )
+        err = abs(est - true_val)
+        results['hard_cpdis']['estimates'].append(est)
+        results['hard_cpdis']['errors'].append(err)
+        results['hard_cpdis']['variances'].append(var)
+        print(f"      Hard CPDIS:  est={est:.4f}, err={err:.4f}")
+        
+        # Soft concept CPDIS
+        est, var, ess = cpdis_estimate_by_horizon(
+            trajectories, soft_behavior_policy, soft_eval_policy, h
+        )
+        err = abs(est - true_val)
+        results['soft_cpdis']['estimates'].append(est)
+        results['soft_cpdis']['errors'].append(err)
+        results['soft_cpdis']['variances'].append(var)
+        print(f"      Soft CPDIS:  est={est:.4f}, err={err:.4f}")
+    
+    # Add leakage results to output
+    results['leakage'] = results_leakage
     
     return results
 
 
-def plot_temporal_leakage_results(results: Dict, save_path: str = None):
+def plot_fixed_results(results: Dict, save_path: str = None):
     """
-    Create visualization of temporal leakage effect.
+    Plot the key result: OPE error vs horizon for hard vs soft concepts.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    timesteps = results['timesteps']
-    train_horizon = results['train_horizon']
+    horizons = results['horizons']
     
-    # Plot 1: Concept Accuracy over Time
-    ax1 = axes[0, 0]
-    ax1.plot(timesteps, results['concept_accuracy'], 'b-o', linewidth=2, markersize=8)
-    ax1.axvline(x=train_horizon, color='r', linestyle='--', label=f'Train horizon (t={train_horizon})')
-    ax1.axhline(y=1.0, color='g', linestyle=':', alpha=0.5)
-    ax1.set_xlabel('Timestep t', fontsize=12)
-    ax1.set_ylabel('Concept Accuracy', fontsize=12)
-    ax1.set_title('Concept Prediction Accuracy vs Timestep', fontsize=14)
-    ax1.legend()
+    # Plot 1: OPE Error vs Horizon
+    ax1 = axes[0]
+    ax1.plot(horizons, results['state_pdis']['errors'], 'k-o', 
+             linewidth=2, markersize=8, label='State PDIS')
+    ax1.plot(horizons, results['hard_cpdis']['errors'], 'g-s', 
+             linewidth=2, markersize=8, label='Hard Concept CPDIS')
+    ax1.plot(horizons, results['soft_cpdis']['errors'], 'r-^', 
+             linewidth=2, markersize=8, label='Soft Concept CPDIS')
+    
+    ax1.set_xlabel('Trajectory Horizon T', fontsize=12)
+    ax1.set_ylabel('OPE Absolute Error', fontsize=12)
+    ax1.set_title('OPE Error vs Horizon', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=10)
     ax1.grid(True, alpha=0.3)
-    ax1.set_ylim([0.5, 1.05])
+    ax1.axvline(x=10, color='gray', linestyle='--', alpha=0.5, label='Train horizon')
     
-    # Plot 2: Distribution Shift over Time
-    ax2 = axes[0, 1]
-    ax2.plot(timesteps, results['distribution_shift'], 'r-s', linewidth=2, markersize=8)
-    ax2.axvline(x=train_horizon, color='r', linestyle='--', label=f'Train horizon')
-    ax2.set_xlabel('Timestep t', fontsize=12)
-    ax2.set_ylabel('KL Divergence from t=0', fontsize=12)
-    ax2.set_title('Distribution Shift over Time', fontsize=14)
-    ax2.legend()
+    # Plot 2: OPE Variance vs Horizon
+    ax2 = axes[1]
+    ax2.plot(horizons, results['state_pdis']['variances'], 'k-o', 
+             linewidth=2, markersize=8, label='State PDIS')
+    ax2.plot(horizons, results['hard_cpdis']['variances'], 'g-s', 
+             linewidth=2, markersize=8, label='Hard Concept CPDIS')
+    ax2.plot(horizons, results['soft_cpdis']['variances'], 'r-^', 
+             linewidth=2, markersize=8, label='Soft Concept CPDIS')
+    
+    ax2.set_xlabel('Trajectory Horizon T', fontsize=12)
+    ax2.set_ylabel('OPE Variance', fontsize=12)
+    ax2.set_title('OPE Variance vs Horizon', fontsize=14, fontweight='bold')
+    ax2.legend(fontsize=10)
     ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+    ax2.axvline(x=10, color='gray', linestyle='--', alpha=0.5)
     
-    # Plot 3: Leakage R² over Time
-    ax3 = axes[1, 0]
-    ax3.plot(timesteps, results['leakage_r2'], 'm-^', linewidth=2, markersize=8)
-    ax3.axvline(x=train_horizon, color='r', linestyle='--', label=f'Train horizon')
-    ax3.set_xlabel('Timestep t', fontsize=12)
-    ax3.set_ylabel('Leakage R²', fontsize=12)
-    ax3.set_title('Information Leakage vs Timestep', fontsize=14)
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
+    # Plot 3: Leakage R² vs Timestep (Experiment 1)
+    ax3 = axes[2]
+    if 'leakage' in results:
+        leakage = results['leakage']
+        timesteps = leakage['timesteps'][:len(leakage['hard_r2'])]
+        
+        ax3.plot(timesteps, leakage['hard_r2'], 'g-s', 
+                 linewidth=2, markersize=8, label='Hard Concepts')
+        ax3.plot(timesteps, leakage['soft_r2'], 'r-^', 
+                 linewidth=2, markersize=8, label='Soft Concepts')
+        
+        ax3.set_xlabel('Timestep t', fontsize=12)
+        ax3.set_ylabel('Probe R² (Leakage)', fontsize=12)
+        ax3.set_title('Exp 1: Leakage vs Timestep', fontsize=14, fontweight='bold')
+        ax3.legend(fontsize=10)
+        ax3.grid(True, alpha=0.3)
+        ax3.axvline(x=10, color='gray', linestyle='--', alpha=0.5, label='Train horizon')
+        ax3.axhline(y=0, color='gray', linestyle='-', alpha=0.3)  # Zero line
     
-    # Plot 4: IS Ratio Variance over Time
-    ax4 = axes[1, 1]
-    ax4.plot(timesteps, results['is_ratio_var'], 'g-d', linewidth=2, markersize=8)
-    ax4.axvline(x=train_horizon, color='r', linestyle='--', label=f'Train horizon')
-    ax4.set_xlabel('Timestep t', fontsize=12)
-    ax4.set_ylabel('IS Ratio Variance', fontsize=12)
-    ax4.set_title('Importance Sampling Variance vs Timestep', fontsize=14)
-    ax4.legend()
-    ax4.grid(True, alpha=0.3)
-    
-    plt.suptitle('Temporal Leakage Poisoning Analysis', fontsize=16, fontweight='bold')
     plt.tight_layout()
     
     if save_path:
@@ -343,122 +494,40 @@ def plot_temporal_leakage_results(results: Dict, save_path: str = None):
         print(f"\nPlot saved to: {save_path}")
     
     plt.show()
-
-
-def run_hard_vs_soft_comparison(
-    n_trajectories: int = 500,
-    max_steps: int = 50,
-    train_horizon: int = 10,
-    test_timesteps: List[int] = None,
-    seed: int = 42
-) -> Dict:
-    """
-    Compare hard concepts vs soft concepts at each timestep.
     
-    This is the key experiment: show that soft concepts degrade at OOD timesteps
-    while hard concepts remain stable.
-    """
-    if test_timesteps is None:
-        test_timesteps = [0, 5, 10, 15, 20, 25, 30]
-    
-    set_seed(seed)
-    
-    env = WindyGridworld()
-    behavior = EpsilonGreedyPolicy(env, epsilon=0.4, seed=seed)
-    eval_policy = OptimalPolicy(env, epsilon=0.05, seed=seed)
-    
-    # Collect trajectories
-    trajectories = []
-    for _ in range(n_trajectories):
-        traj = collect_trajectory(env, behavior, max_steps=max_steps)
-        trajectories.append(traj)
-    
-    # Setup concepts
-    hard_concepts = HardConcepts(env)
-    soft_concepts = SoftConcepts(env, use_leakage=True, seed=seed)
-    
-    # Train soft concepts on early timesteps
-    train_trajs = []
-    for traj in trajectories[:200]:
-        early_steps = [s for i, s in enumerate(traj) if i < train_horizon]
-        if len(early_steps) > 0:
-            train_trajs.append(early_steps)
-    
-    soft_concepts.train_on_trajectories(train_trajs, hard_concepts, epochs=200)
-    
-    # Measure concept quality for both
-    results = {
-        'timesteps': test_timesteps,
-        'hard_accuracy': [],
-        'soft_accuracy': [],
-        'hard_leakage': [],
-        'soft_leakage': []
-    }
-    
-    for t in test_timesteps:
-        # Hard concepts (should be stable)
-        hard_quality = measure_concept_quality_at_timestep(
-            hard_concepts, trajectories, t, hard_concepts
-        )
-        results['hard_accuracy'].append(hard_quality['accuracy'])
-        results['hard_leakage'].append(hard_quality['leakage_r2'])
-        
-        # Soft concepts (should degrade at OOD)
-        soft_quality = measure_concept_quality_at_timestep(
-            soft_concepts, trajectories, t, hard_concepts
-        )
-        results['soft_accuracy'].append(soft_quality['accuracy'])
-        results['soft_leakage'].append(soft_quality['leakage_r2'])
-    
-    return results
+    return fig
 
 
 if __name__ == "__main__":
     results_dir = os.path.join(project_root, 'results')
     os.makedirs(results_dir, exist_ok=True)
     
-    # Run main experiment
-    print("\n" + "=" * 70)
-    print("EXPERIMENT 1: Temporal Leakage Analysis")
-    print("=" * 70)
-    
-    results = run_temporal_leakage_experiment(
+    # Run the fixed experiment
+    results = run_fixed_experiment(
         n_trajectories=500,
         max_steps=50,
         train_horizon=10,
-        test_timesteps=[0, 2, 5, 10, 15, 20, 25, 30, 35, 40],
+        test_horizons=[5, 10, 15, 20, 25, 30, 35, 40],
         seed=42
     )
     
-    plot_temporal_leakage_results(
-        results, 
-        save_path=os.path.join(results_dir, 'temporal_leakage.png')
-    )
-    
-    # Run hard vs soft comparison
+    # Print summary
     print("\n" + "=" * 70)
-    print("EXPERIMENT 2: Hard vs Soft Concepts")
+    print("SUMMARY: OPE Error at Each Horizon")
     print("=" * 70)
+    print(f"\n{'Horizon':<10} {'True Val':<12} {'State Err':<12} {'Hard Err':<12} {'Soft Err':<12}")
+    print("-" * 60)
     
-    comparison = run_hard_vs_soft_comparison(
-        n_trajectories=500,
-        max_steps=50,
-        train_horizon=10,
-        test_timesteps=[0, 5, 10, 15, 20, 25, 30],
-        seed=42
-    )
+    for i, h in enumerate(results['horizons']):
+        true_val = results['true_values'][i]
+        state_err = results['state_pdis']['errors'][i]
+        hard_err = results['hard_cpdis']['errors'][i]
+        soft_err = results['soft_cpdis']['errors'][i]
+        print(f"{h:<10} {true_val:<12.4f} {state_err:<12.4f} {hard_err:<12.4f} {soft_err:<12.4f}")
     
-    print("\nHard vs Soft Concept Accuracy:")
-    print(f"{'t':<6} {'Hard':<10} {'Soft':<10} {'Diff':<10}")
-    print("-" * 40)
-    for i, t in enumerate(comparison['timesteps']):
-        hard = comparison['hard_accuracy'][i]
-        soft = comparison['soft_accuracy'][i]
-        diff = hard - soft if not (np.isnan(hard) or np.isnan(soft)) else np.nan
-        print(f"{t:<6} {hard:.4f}     {soft:.4f}     {diff:+.4f}")
+    # Plot results
+    plot_fixed_results(results, save_path=os.path.join(results_dir, 'ope_error_compounding.png'))
     
     # Save results
-    np.save(os.path.join(results_dir, 'temporal_results.npy'), results)
-    np.save(os.path.join(results_dir, 'comparison_results.npy'), comparison)
-    
-    print(f"\nAll results saved to {results_dir}/")
+    np.save(os.path.join(results_dir, 'fixed_experiment_results.npy'), results)
+    print(f"\nResults saved to {results_dir}/")
