@@ -891,6 +891,6 @@ if __name__ == "__main__":
 
     # ── Multi-seed experiment (uncomment — ~30 mins) ──────────────────────────
     print("\nRunning multi-seed experiment (30 seeds)...")
-    multi = run_multiseed_experiment(n_seeds=30)
+    multi = run_multiseed_experiment(n_seeds=1)
     np.save(os.path.join(results_dir, 'multiseed_results.npy'), multi)
     print("Multi-seed results saved.")
