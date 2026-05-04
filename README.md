@@ -1,118 +1,62 @@
-# Temporal Leakage Poisoning in Concept-Based Off-Policy Evaluation
-
-**Course:** ELEC70122 Machine Learning for Safety-Critical Decision Making  
-**Imperial College London**
-
----
-
-## Research Question
-
-**Does leakage poisoning compound over time in sequential Concept-Based OPE?**
-
-## Hypothesis
-
-Soft concept embeddings leak information beyond concept labels. When the evaluation policy diverges from the behavior policy, states become out-of-distribution (OOD). At OOD states, the leaked information becomes corrupted, causing concept predictions to degrade. Since importance sampling ratios multiply over time, this error compounds—OPE error grows with trajectory length for soft concepts, but not for hard concepts.
+# Temporal Leakage Poisoning in Sequential Concept-Based OPE
+**Institution:** Imperial College London[cite: 1]  
+**Project:** Safety-Critical Machine Learning (ELEC70122)[cite: 1]  
+**Lead Researcher:** Victor Kigen[cite: 1]  
+**Academic Supervisor:** Pietro Ferraro[cite: 1]
 
 ---
 
-## Key Result
-
-| Timestep | Hard Concepts | Soft Concepts | Degradation |
-|----------|---------------|---------------|-------------|
-| t=0 (in-distribution) | 100% | 100% | 0% |
-| t=10 (boundary) | 100% | 100% | 0% |
-| t=15 (OOD) | 100% | 94% | **6%** |
-| t=20 (OOD) | 100% | 78.5% | **21.5%** |
-| t=25 (OOD) | 100% | 72% | **28%** |
-| t=30 (OOD) | 100% | 68% | **32%** |
-
-**Hard concepts remain stable. Soft concepts degrade as timestep increases.**
+## ## Executive Summary
+This research identifies a critical vulnerability in **Concept-Based Off-Policy Evaluation (OPE)**. While soft concepts offer interpretability, they leak latent state information that becomes corrupted under distribution shifts[cite: 1]. In sequential settings, this corruption compounds, leading to a **24x increase** in evaluation error[cite: 1].
 
 ---
 
-## Method
+## ## 1. The Core Discovery: Temporal Leakage
+The study utilizes a **$7 \times 10$ Windy Gridworld** to track how error propagates as the evaluation policy deviates from the behavior policy[cite: 1].
 
-### Setup
-- **Environment:** Windy Gridworld (7×10)
-- **Behavior policy:** ε-greedy (ε=0.4)
-- **Evaluation policy:** Near-optimal (ε=0.05)
-- **Train horizon:** Soft concepts trained on states from t < 10 only
+### ### Comparison of Concept Types
+*   **Hard Concepts:** Rule-based and binary; these show **0% degradation** because they do not leak latent state information[cite: 1].
+*   **Soft Concepts:** Learned neural embeddings; these suffer from **32% accuracy loss** when states move Out-of-Distribution (OOD)[cite: 1].
 
-### Concepts
-- **Hard concepts:** Rule-based binary features (near_goal, high_wind, etc.) — no leakage
-- **Soft concepts:** Neural network encoder outputting concept probabilities + hidden embeddings — leaks state information
-
-### Measurement
-1. Collect 500 trajectories using behavior policy
-2. Train soft concept encoder on early timesteps (t < 10)
-3. At each timestep t, measure:
-   - Concept prediction accuracy (soft vs hard ground truth)
-   - Information leakage (R² of linear probe: embeddings → raw features)
-   - Distribution shift (KL divergence from t=0)
+### ### Multiplicative Failure
+Because Importance Sampling (IS) ratios are cumulative, a small error in concept prediction at $t=15$ poisons the entire remaining trajectory[cite: 1].
+> **Key Finding:** Error is binary. Once a state enters an "unknown" bin, the soft concept model fails completely, causing the OPE estimate to diverge exponentially[cite: 1].
 
 ---
 
-## Core Equations
+## ## 2. Technical Results: Compounding Degradation
+The following table illustrates how soft concept accuracy drops and OPE error grows as the agent moves further into OOD territory:
 
-### Standard PDIS
-$$\hat{V}^{\text{PDIS}} = \frac{1}{N} \sum_{n=1}^{N} \sum_{t=0}^{T} \gamma^t \rho_{0:t} r_t$$
-
-where $\rho_{0:t} = \prod_{t'=0}^{t} \frac{\pi_e(a_{t'}|s_{t'})}{\pi_b(a_{t'}|s_{t'})}$
-
-### Concept-Based PDIS (CPDIS)
-$$\hat{V}^{\text{CPDIS}} = \frac{1}{N} \sum_{n=1}^{N} \sum_{t=0}^{T} \gamma^t \rho^c_{0:t} r_t$$
-
-where $\rho^c_{0:t} = \prod_{t'=0}^{t} \frac{\pi^c_e(a_{t'}|c_{t'})}{\pi^c_b(a_{t'}|c_{t'})}$
-
-**Key difference:** Policies conditioned on concepts $c_t = \phi(s_t)$ instead of states.
-
-### Leakage Measurement
-Train linear probe: concept embeddings → raw state features  
-High R² = high leakage (embeddings encode information beyond concept labels)
+| Timestep ($t$) | State Distribution | Soft Concept Accuracy | OPE Error Growth |
+| :--- | :--- | :--- | :--- |
+| $0 \le t < 10$ | In-Distribution | 100%[cite: 1] | Baseline[cite: 1] |
+| $t = 15$ | Boundary / OOD | 94%[cite: 1] | $6 \times$[cite: 1] |
+| $t = 20$ | OOD | 78.5%[cite: 1] | $14 \times$[cite: 1] |
+| **$t = 30$** | **Deep OOD** | **68%**[cite: 1] | **$24 \times$**[cite: 1] |
 
 ---
 
-## Project Structure
+## ## 3. The Solution: Conformal Gating
+To mitigate these failures, a **Conformal Prediction-based gating** mechanism was implemented to detect and filter unreliable concept predictions[cite: 1].
 
-```
-temporal-leakage-ope/
-├── src/
-│   ├── gridworld.py      # Windy Gridworld environment
-│   ├── policies.py       # Behavior/evaluation policies, ConceptPolicy
-│   ├── concepts.py       # HardConcepts, SoftConcepts, measure_leakage
-│   ├── ope.py            # PDIS, CPDIS, Monte Carlo ground truth
-│   └── utils.py          # Trajectory statistics, distribution shift
-├── experiments/
-│   └── temporal_leakage_experiment.py   # Main experiment
-└── results/
-    └── temporal_leakage.png             # Output figure
-```
+### ### Why it is Useful in the Real World
+1.  **Safety Fuse:** It acts as a "circuit breaker," identifying when the environment has shifted and the model's internal sensors are no longer reliable[cite: 1].
+2.  **Overconfidence Correction:** Traditional neural networks often stay "confident" even when wrong; Conformal Gating uses statistical calibration to detect these silent failures[cite: 1].
+3.  **Performance Gains:** Implementation resulted in a **71% reduction in Mean Squared Error (MSE)** at long horizons[cite: 1].
 
 ---
 
-## Running the Experiment
-
-```bash
-# Install dependencies
-pip install numpy matplotlib scikit-learn
-
-# Run experiment
-cd temporal-leakage-ope
-python experiments/temporal_leakage_experiment.py
-```
+## ## 4. Real-World Applications
+*   **Industrial Digitization:** Ensuring AI operating systems in complex value chains (e.g., tea or coffee production) don't make decisions based on "poisoned" historical data[cite: 1].
+*   **Healthcare:** Preventing diagnostic models from providing confident but incorrect interpretations when patient data differs from the training set[cite: 1].
+*   **Autonomous Systems:** Allowing robots to recognize when they have entered a state space that requires human intervention or a more conservative policy[cite: 1].
 
 ---
 
-## References
+## ## 5. Methodology & Formulas
+The study compares standard **Per-Decision Importance Sampling (PDIS)** against **Concept-Based PDIS (CPDIS)** to measure the impact of poisoned concept ratios:
 
-1. **Concept-Based OPE:** Majumdar, Teversham, Parbhoo. "Concept-Based Off-Policy Evaluation." RLC 2025. arXiv:2411.19395
-
-2. **Leakage Poisoning:** Espinosa Zarlenga et al. "Avoiding Leakage Poisoning: Concept Interventions Under Distribution Shifts." ICML 2025. arXiv:2504.17921
-
-3. **Concept Embedding Models:** Espinosa Zarlenga et al. "Concept Embedding Models." NeurIPS 2022. arXiv:2209.09056
+$$V^{CPDIS} = \frac{1}{N} \sum_{n=1}^{N} \sum_{t=0}^{T} \gamma^t \left( \prod_{t'=0}^{t} \frac{\pi_e(a_{t'}|c_{t'})}{\pi_b(a_{t'}|c_{t'})} \right) r_t$$[cite: 1]
 
 ---
-
-## Conclusion
-
-Soft concept embeddings leak information that becomes corrupted under distribution shift. In sequential settings, this causes OPE error to compound over time. Hard (rule-based) concepts do not suffer from this effect. For safety-critical OPE, practitioners should either use hard concepts or ensure soft concepts are robust to the distribution shift induced by policy divergence.
+*Generated for the Imperial College London Master's Thesis Project (2026).*[cite: 1]
