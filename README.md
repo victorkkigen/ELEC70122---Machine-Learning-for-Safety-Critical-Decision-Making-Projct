@@ -59,4 +59,4 @@ The study compares standard **Per-Decision Importance Sampling (PDIS)** against 
 $$V^{CPDIS} = \frac{1}{N} \sum_{n=1}^{N} \sum_{t=0}^{T} \gamma^t \left( \prod_{t'=0}^{t} \frac{\pi_e(a_{t'}|c_{t'})}{\pi_b(a_{t'}|c_{t'})} \right) r_t$$
 
 ---
-*Generated for the Imperial College London Master's Thesis Project (2026).*
+
